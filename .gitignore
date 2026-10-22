@@ -1,0 +1,6 @@
+# Owner's private state / Личные данные владельца
+local/
+
+# Debugging tools stay local, only the mod is committed / Инструменты отладки остаются локально, в репозитории только мод
+tools/
+.playwright-mcp/
