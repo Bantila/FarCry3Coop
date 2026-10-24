@@ -1,0 +1,2 @@
+data_win32/worlds/multicommon/multicommon_japanese.dat
+data_win32/worlds/multicommon/multicommon_japanese.fat

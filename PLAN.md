@@ -10,6 +10,13 @@ Four players pass the whole single-player story of Far Cry 3 together, with cuts
 activities (outposts, towers, hunting, Path of the Hunter, Wanted Dead, trials, races) and
 collectibles (relics, letters, memory cards). Friends join through a **Steam invite**.
 
+**Game versions (owner decision 2026-10-24):** both are supported: **1.05** (Steam depot 220241,
+manifest `7362101836779063707`, DLL build 2018-05-02, the last version with multiplayer, the one
+scubrah's mod is built on) and **1.06** (current Steam / Ubisoft Connect, build 2022-10-03; hard to
+downgrade to 1.05). Each version has its own addresses; a shared address map is built by the script
+`scripts\fc3_addrmap.py`. Ubisoft servers for FC3 are shut down, so joining goes only
+through our own transport.
+
 The game has no campaign co-op: only a separate 6-mission co-op campaign in multiplayer.
 Prior art: "Open World Co-op" by scubrah (https://www.nexusmods.com/farcry3/mods/220, alpha,
 no story missions).

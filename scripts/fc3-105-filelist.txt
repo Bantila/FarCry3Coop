@@ -1,0 +1,3 @@
+regex:^bin[\\/]
+regex:^data_win32[\\/]patch
+regex:^data_win32[\\/]igepatch

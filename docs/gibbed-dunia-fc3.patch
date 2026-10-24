@@ -1,0 +1,399 @@
+diff --git a/configs/Far Cry 3/project.json b/configs/Far Cry 3/project.json
+new file mode 100644
+index 0000000..6e21948
+--- /dev/null
++++ b/configs/Far Cry 3/project.json	
+@@ -0,0 +1,48 @@
++{
++  "name": "Far Cry 3",
++  "list_location": ".",
++  "install_locations": [
++    {
++      "actions": [
++        { "type": "registryview", "view": "Registry64", "hive": "LocalMachine", "sub_key": "SOFTWARE\\Ubisoft\\Far Cry 2", "value": "InstallDir" },
++        { "type": "combine", "value": "Data_Win32" }
++      ]
++    },
++    {
++      "actions": [
++        { "type": "registryview", "view": "Registry32", "hive": "LocalMachine", "sub_key": "SOFTWARE\\Ubisoft\\Far Cry 2", "value": "InstallDir" },
++        { "type": "combine", "value": "Data_Win32" }
++      ]
++    },
++    {
++      "actions": [
++        { "type": "registryview", "view": "Registry64", "hive": "LocalMachine", "sub_key": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 19900", "value": "InstallLocation" },
++        { "type": "combine", "value": "Data_Win32" }
++      ]
++    },
++    {
++      "actions": [
++        { "type": "registryview", "view": "Registry32", "hive": "LocalMachine", "sub_key": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 19900", "value": "InstallLocation" },
++        { "type": "combine", "value": "Data_Win32" }
++      ]
++    },
++    {
++      "actions": [
++        { "type": "registryview", "view": "Registry64", "hive": "LocalMachine", "sub_key": "SOFTWARE\\Valve\\Steam", "value": "InstallPath" },
++        { "type": "combine", "value": "steamapps" },
++        { "type": "combine", "value": "common" },
++        { "type": "combine", "value": "Far Cry 2" },
++        { "type": "combine", "value": "Data_Win32" }
++      ]
++    },
++    {
++      "actions": [
++        { "type": "registryview", "view": "Registry32", "hive": "LocalMachine", "sub_key": "SOFTWARE\\Valve\\Steam", "value": "InstallPath" },
++        { "type": "combine", "value": "steamapps" },
++        { "type": "combine", "value": "common" },
++        { "type": "combine", "value": "Far Cry 2" },
++        { "type": "combine", "value": "Data_Win32" }
++      ]
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/projects/Gibbed.Dunia.FileFormats/BigFileV2.cs b/projects/Gibbed.Dunia.FileFormats/BigFileV2.cs
+index 9d0e6b8..025d168 100644
+--- a/projects/Gibbed.Dunia.FileFormats/BigFileV2.cs
++++ b/projects/Gibbed.Dunia.FileFormats/BigFileV2.cs
+@@ -68,7 +68,36 @@ namespace Gibbed.Dunia.FileFormats
+ 
+         public void Serialize(Stream output)
+         {
+-            throw new NotImplementedException();
++            // Only FAT v9 (Far Cry 3) is known well enough to write:
++            // header, entries sorted by hash, then 8 zero bytes (localization count + unknown).
++            if (this._Version.FileVersion != 9)
++            {
++                throw new NotSupportedException("writing is only implemented for version 9");
++            }
++
++            var endian = this._Endian;
++            var entrySerializer = GetEntrySerializer(this._Version.FileVersion);
++
++            uint flags = 0;
++            flags |= FromPlatform(this._Version.Platform);
++            flags |= (uint)this._Version.CompressionVersion << 8;
++
++            output.WriteValueU32(Signature, endian);
++            output.WriteValueU32((uint)this._Version.FileVersion, endian);
++            output.WriteValueU32(flags, endian);
++            output.WriteValueU32(0, endian); // unknown0C (locale tables, world archives only)
++            output.WriteValueU32(0, endian); // unknown10
++            output.WriteValueS32(this._Entries.Count, endian);
++
++            var entries = new List<Entry<T>>(this._Entries);
++            entries.Sort((x, y) => Comparer<T>.Default.Compare(x.NameHash, y.NameHash));
++            foreach (var entry in entries)
++            {
++                entrySerializer.Serialize(output, entry, endian);
++            }
++
++            output.WriteValueU32(0, endian); // localization count
++            output.WriteValueU32(0, endian); // unknown, zero in shipped FC3 archives
+         }
+ 
+         public void Deserialize(Stream input)
+@@ -113,10 +142,8 @@ namespace Gibbed.Dunia.FileFormats
+                 throw new FormatException("unknown version/platform/CV combination");
+             }
+ 
+-            if (unknown0C != 0 || unknown10 != 0)
+-            {
+-                throw new NotImplementedException();
+-            }
++            // FC3 world archives: u0C/u10 describe locale tables after the entries; main table is still complete (max offset = .dat size)
++            var hasLocaleTables = unknown0C != 0 || unknown10 != 0;
+ 
+             var entryCount = input.ReadValueS32(endian);
+             if (entryCount < 0)
+@@ -152,7 +179,7 @@ namespace Gibbed.Dunia.FileFormats
+                 }
+             }
+ 
+-            uint localizationCount = input.ReadValueU32(endian);
++            uint localizationCount = hasLocaleTables ? 0u : input.ReadValueU32(endian);
+             for (uint i = 0; i < localizationCount; i++)
+             {
+                 var nameLength = input.ReadValueU32(endian);
+@@ -243,6 +270,7 @@ namespace Gibbed.Dunia.FileFormats
+         {
+             return version.FileVersion switch
+             {
++                 9 => (CompressionScheme)id,
+                 10 => CompressionSchemeV10_V11.ToCompressionScheme(version, id),
+                 11 => CompressionSchemeV10_V11.ToCompressionScheme(version, id),
+                 _ => throw new NotSupportedException(),
+@@ -258,6 +286,7 @@ namespace Gibbed.Dunia.FileFormats
+         {
+             return version.FileVersion switch
+             {
++                 9 => (byte)compressionScheme,
+                 10 => CompressionSchemeV10_V11.FromCompressionScheme(version, compressionScheme),
+                 11 => CompressionSchemeV10_V11.FromCompressionScheme(version, compressionScheme),
+                 _ => throw new NotSupportedException(),
+diff --git a/projects/Gibbed.Dunia.Packing/EntryDecompression.cs b/projects/Gibbed.Dunia.Packing/EntryDecompression.cs
+index 815d8d1..45c0114 100644
+--- a/projects/Gibbed.Dunia.Packing/EntryDecompression.cs
++++ b/projects/Gibbed.Dunia.Packing/EntryDecompression.cs
+@@ -41,13 +41,13 @@ namespace Gibbed.Dunia.Packing
+             Stream output,
+             int maxSize = -1)
+         {
+-            if (entry.UncompressedSize <= 0)
++            var compressionScheme = archive.ToCompressionScheme(entry.CompressionScheme);
++
++            if ((compressionScheme == CompressionScheme.None ? GetStoredSize(entry) : entry.UncompressedSize) <= 0)
+             {
+                 return;
+             }
+ 
+-            var compressionScheme = archive.ToCompressionScheme(entry.CompressionScheme);
+-
+             input.Position = entry.Offset;
+ 
+             Stream temp;
+@@ -55,7 +55,7 @@ namespace Gibbed.Dunia.Packing
+             {
+                 var entrySize = compressionScheme != CompressionScheme.None
+                     ? entry.CompressedSize
+-                    : entry.UncompressedSize;
++                    : GetStoredSize(entry);
+                 var encryptedSize = Math.Min(0x100000, entrySize);
+                 encryptedSize &= ~7;
+                 if (encryptedSize > 0)
+@@ -94,9 +94,14 @@ namespace Gibbed.Dunia.Packing
+                 _ => throw new NotSupportedException("unsupported compression scheme"),
+             };
+ 
++        // FAT v9 (Far Cry 3) stores uncompressed entries with UncompressedSize = 0 and the size in CompressedSize
++        private static int GetStoredSize(IEntry entry) =>
++            entry.UncompressedSize > 0 ? entry.UncompressedSize : entry.CompressedSize;
++
+         private static void DecompressNone(IEntry entry, Stream input, Stream output, int maxSize)
+         {
+-            output.WriteFromStream(input, entry.UncompressedSize);
++            var size = GetStoredSize(entry);
++            output.WriteFromStream(input, maxSize < 0 ? size : Math.Min(maxSize, size));
+         }
+ 
+         private static void DecompressLZO1x(IEntry entry, Stream input, Stream output, int maxSize)
+@@ -126,7 +131,7 @@ namespace Gibbed.Dunia.Packing
+                 throw new InvalidOperationException("LZO decompression failure (uncompressed size mismatch)");
+             }
+ 
+-            output.Write(uncompressedBytes, 0, uncompressedBytes.Length);
++            output.Write(uncompressedBytes, 0, maxSize < 0 ? uncompressedBytes.Length : Math.Min(maxSize, uncompressedBytes.Length));
+         }
+ 
+         private static void DecompressZlib(IEntry entry, Stream input, Stream output, int maxSize)
+diff --git a/projects/Gibbed.Dunia.Packing/Pack.cs b/projects/Gibbed.Dunia.Packing/Pack.cs
+index c3db2d2..654f9a2 100644
+--- a/projects/Gibbed.Dunia.Packing/Pack.cs
++++ b/projects/Gibbed.Dunia.Packing/Pack.cs
+@@ -84,12 +84,22 @@ namespace Gibbed.Dunia.Packing
+             string[] args,
+             Big.Platform defaultPlatform,
+             Big.TryGetHashOverride<THash> tryGetHashOverride)
++        {
++            Main(args, defaultPlatform, tryGetHashOverride, null, null);
++        }
++
++        public static void Main(
++            string[] args,
++            Big.Platform defaultPlatform,
++            Big.TryGetHashOverride<THash> tryGetHashOverride,
++            int? defaultVersion,
++            byte? compressionVersion)
+         {
+             bool showHelp = false;
+             bool verbose = false;
+             bool compress = false;
+ 
+-            int? version = null;
++            int? version = defaultVersion;
+             var platform = defaultPlatform;
+ 
+             var options = new OptionSet()
+@@ -158,7 +168,7 @@ namespace Gibbed.Dunia.Packing
+ 
+             var fat = new TArchive()
+             {
+-                Version = (version.Value, platform, GetCompressionVersionForPlatform(platform)),
++                Version = (version.Value, platform, compressionVersion ?? GetCompressionVersionForPlatform(platform)),
+             };
+ 
+             if (verbose == true)
+@@ -207,9 +217,10 @@ namespace Gibbed.Dunia.Packing
+                             continue;
+                         }
+ 
+-                        if (partName.Length > 8)
++                        // 16 hex digits for 64-bit hashes; shorter 32-bit names parse unchanged
++                        if (partName.Length > 16)
+                         {
+-                            partName = partName.Substring(0, 8);
++                            partName = partName.Substring(0, 16);
+                         }
+ 
+                         pendingEntry.Name = null;
+diff --git a/projects/Gibbed.Dunia.Packing/Unpack.cs b/projects/Gibbed.Dunia.Packing/Unpack.cs
+index f75e0b3..c5adf3f 100644
+--- a/projects/Gibbed.Dunia.Packing/Unpack.cs
++++ b/projects/Gibbed.Dunia.Packing/Unpack.cs
+@@ -262,10 +262,12 @@ namespace Gibbed.Dunia.Packing
+                 var compressionScheme = archive.ToCompressionScheme(entry.CompressionScheme);
+                 if (compressionScheme == Big.CompressionScheme.None)
+                 {
+-                    if (entry.UncompressedSize > 0)
++                    // FAT v9 keeps the stored size of uncompressed entries in CompressedSize
++                    var storedSize = entry.UncompressedSize > 0 ? entry.UncompressedSize : entry.CompressedSize;
++                    if (storedSize > 0)
+                     {
+                         input.Position = entry.Offset;
+-                        read = input.Read(guess, 0, (int)Math.Min(entry.UncompressedSize, guess.Length));
++                        read = input.Read(guess, 0, (int)Math.Min(storedSize, guess.Length));
+                     }
+                 }
+                 else
+diff --git a/projects/Gibbed.FarCry3.Pack/Gibbed.FarCry3.Pack.csproj b/projects/Gibbed.FarCry3.Pack/Gibbed.FarCry3.Pack.csproj
+new file mode 100644
+index 0000000..ba4a3d8
+--- /dev/null
++++ b/projects/Gibbed.FarCry3.Pack/Gibbed.FarCry3.Pack.csproj
+@@ -0,0 +1,20 @@
++﻿<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <Company>Gibbed</Company>
++    <Authors>Gibbed</Authors>
++    <Description>http://gib.me/</Description>
++    <Copyright>Copyright © Gibbed 2021</Copyright>
++  </PropertyGroup>
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFramework>net48</TargetFramework>
++    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
++  </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
++    <OutputPath>..\..\bin_fc3\</OutputPath>
++  </PropertyGroup>
++  <ItemGroup>
++    <ProjectReference Include="..\Gibbed.Dunia.FileFormats\Gibbed.Dunia.FileFormats.csproj" />
++    <ProjectReference Include="..\Gibbed.Dunia.Packing\Gibbed.Dunia.Packing.csproj" />
++  </ItemGroup>
++</Project>
+\ No newline at end of file
+diff --git a/projects/Gibbed.FarCry3.Pack/Program.cs b/projects/Gibbed.FarCry3.Pack/Program.cs
+new file mode 100644
+index 0000000..f38b6de
+--- /dev/null
++++ b/projects/Gibbed.FarCry3.Pack/Program.cs
+@@ -0,0 +1,38 @@
++﻿/* Copyright (c) 2021 Rick (rick 'at' gibbed 'dot' us)
++ *
++ * This software is provided 'as-is', without any express or implied
++ * warranty. In no event will the authors be held liable for any damages
++ * arising from the use of this software.
++ *
++ * Permission is granted to anyone to use this software for any purpose,
++ * including commercial applications, and to alter it and redistribute it
++ * freely, subject to the following restrictions:
++ *
++ * 1. The origin of this software must not be misrepresented; you must not
++ *    claim that you wrote the original software. If you use this software
++ *    in a product, an acknowledgment in the product documentation would
++ *    be appreciated but is not required.
++ *
++ * 2. Altered source versions must be plainly marked as such, and must not
++ *    be misrepresented as being the original software.
++ *
++ * 3. This notice may not be removed or altered from any source
++ *    distribution.
++ */
++
++using Gibbed.Dunia.FileFormats;
++using Gibbed.Dunia.FileFormats.Big;
++using Gibbed.Dunia.Packing;
++
++namespace Gibbed.FarCry3.Pack
++{
++    public static class Program
++    {
++        public static void Main(string[] args)
++        {
++            // FAT v9, Windows, compression version 3 (as in the shipped data_win32 archives)
++            Pack<BigFileV2_64, NameHasher64, ulong>.Main(args, Platform.Windows, null, 9, 3);
++        }
++    }
++}
++
+diff --git a/projects/Gibbed.FarCry3.Unpack/Gibbed.FarCry3.Unpack.csproj b/projects/Gibbed.FarCry3.Unpack/Gibbed.FarCry3.Unpack.csproj
+new file mode 100644
+index 0000000..ba4a3d8
+--- /dev/null
++++ b/projects/Gibbed.FarCry3.Unpack/Gibbed.FarCry3.Unpack.csproj
+@@ -0,0 +1,20 @@
++﻿<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <Company>Gibbed</Company>
++    <Authors>Gibbed</Authors>
++    <Description>http://gib.me/</Description>
++    <Copyright>Copyright © Gibbed 2021</Copyright>
++  </PropertyGroup>
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFramework>net48</TargetFramework>
++    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
++  </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
++    <OutputPath>..\..\bin_fc3\</OutputPath>
++  </PropertyGroup>
++  <ItemGroup>
++    <ProjectReference Include="..\Gibbed.Dunia.FileFormats\Gibbed.Dunia.FileFormats.csproj" />
++    <ProjectReference Include="..\Gibbed.Dunia.Packing\Gibbed.Dunia.Packing.csproj" />
++  </ItemGroup>
++</Project>
+\ No newline at end of file
+diff --git a/projects/Gibbed.FarCry3.Unpack/Program.cs b/projects/Gibbed.FarCry3.Unpack/Program.cs
+new file mode 100644
+index 0000000..0051053
+--- /dev/null
++++ b/projects/Gibbed.FarCry3.Unpack/Program.cs
+@@ -0,0 +1,36 @@
++﻿/* Copyright (c) 2021 Rick (rick 'at' gibbed 'dot' us)
++ *
++ * This software is provided 'as-is', without any express or implied
++ * warranty. In no event will the authors be held liable for any damages
++ * arising from the use of this software.
++ *
++ * Permission is granted to anyone to use this software for any purpose,
++ * including commercial applications, and to alter it and redistribute it
++ * freely, subject to the following restrictions:
++ *
++ * 1. The origin of this software must not be misrepresented; you must not
++ *    claim that you wrote the original software. If you use this software
++ *    in a product, an acknowledgment in the product documentation would
++ *    be appreciated but is not required.
++ *
++ * 2. Altered source versions must be plainly marked as such, and must not
++ *    be misrepresented as being the original software.
++ *
++ * 3. This notice may not be removed or altered from any source
++ *    distribution.
++ */
++
++using Gibbed.Dunia.FileFormats;
++using Gibbed.Dunia.FileFormats.Big;
++using Gibbed.Dunia.Packing;
++
++namespace Gibbed.FarCry3.Unpack
++{
++    public static class Program
++    {
++        public static void Main(string[] args)
++        {
++            Unpack<BigFileV2_64, NameHasher64, ulong>.Main(args, "Far Cry 3", null);
++        }
++    }
++}
