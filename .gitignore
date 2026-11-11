@@ -4,3 +4,24 @@ local/
 # Debugging tools stay local, only the mod is committed / Инструменты отладки остаются локально, в репозитории только мод
 /tools/
 .playwright-mcp/
+# Agent scratch (delegate output, probe scripts) / черновики агента
+Temp/
+local/scratch/
+*.scratch*
+.scratch*
+scratch_*
+# disassembler caches
+*_dis_cache.json
+__pycache__/
+
+# FC3 co-op probe build artifacts (sources under mod/ are tracked; binaries are not)
+mod/fc3coop_probe/build/
+mod/fc3coop_probe/build_log.txt
+mod/fc3coop_probe/*.log
+
+# uplay_r1_loader proxy build artifacts (sources uplay_proxy.cpp/.def/.c + bats are tracked)
+src/uplay_proxy/obj/
+src/uplay_proxy/*.dll
+src/uplay_proxy/*.lib
+src/uplay_proxy/*.exp
+src/uplay_proxy/*.log

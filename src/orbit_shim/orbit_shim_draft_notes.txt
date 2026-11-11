@@ -1,0 +1,143 @@
+// orbit_shim.cpp - logging shim for Far Cry 3 (32-bit) orbit API traffic.
+// Deployed as bin\d3d9.dll (proxy for the real system d3d9.dll; forwards Direct3DCreate9 etc.).
+//
+// What it does (pass-through, read-only observation - NOTES session 26c next step):
+//  1. Scans the IATs of FC3.exe and every loaded module for imports of
+//     kernel32!GetProcAddress / GetProcAddressForANSIString and redirects them
+//     to our logging hook.
+//  2. Whenever any module asks for "OrbitApi_InterfaceRequest", we resolve the real
+//     pointer, generate a per-request trampoline around our logger, and return that.
+//  3. The logger records: timestamp, thread, interfaceId, first 12 args, requesting
+//     module + RVA (with friendly tags for known netplay RVAs), the real pointer's
+//     module!RVA, plausible stack frames inside FC3/uplay modules, return value.
+//  4. A poller re-scans new modules and re-patches IATs every 2 s, and logs when
+//     uplay_r14.dll appears with its export RVA for OrbitApi_InterfaceRequest.
+//
+// Safety: no inline kernel32 patching (loader-lock/thread races), IAT writes only,
+// all pointer dereferences guarded with SEH (__except). Log: bin\orbit.log.
+// Build: build.bat (MSVC x86 /MT).
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <intrin.h>
+
+#pragma comment(lib, "psapi.lib")
+
+// ---------------------------------------------------------------- logging ---
+static CRITICAL_SECTION g_cs;
+static FILE* g_log = NULL;
+static volatile LONG g_seq = 0;
+
+static void logOpen(void) {
+    if (g_log) return;
+    InitializeCriticalSection(&g_cs);
+    char base[MAX_PATH]; GetModuleFileNameA(NULL, base, MAX_PATH);
+    char* s = strrchr(base, '\\'); if (s) *s = 0;
+    char path[MAX_PATH]; snprintf(path, MAX_PATH, "%s\\orbit.log", base);
+    g_log = fopen(path, "a");
+    if (g_log) { fprintf(g_log, "\n===== orbit_shim attach pid=%u =====\n", GetCurrentProcessId()); fflush(g_log); }
+}
+static void logFmt(const char* fmt, ...) {
+    if (!g_log) return;
+    EnterCriticalSection(&g_cs);
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(g_log, "[%02d:%02d:%02d.%03d] t%u #%lu ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            GetCurrentThreadId(), (unsigned long)InterlockedIncrement(&g_seq));
+    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
+    fprintf(g_log, "\n");
+    LeaveCriticalSection(&g_cs);
+}
+
+// ---------------------------------------------- module/RVA descriptions -----
+static char g_exe_name[64] = "FC3.exe";
+
+static HMODULE modOf(DWORD addr) {
+    HMODULE h = NULL;
+    if (!addr) return NULL;
+    __try {
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCSTR)addr, &h)) return NULL;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+    return h;
+}
+
+static BOOL moduleName(HMODULE h, char* out, size_t cb) {
+    char path[MAX_PATH];
+    if (GetModuleFileNameA(h, path, MAX_PATH)) { char* b = strrchr(path, '\\'); snprintf(out, cb, "%s", b ? b + 1 : path); return TRUE; }
+    snprintf(out, cb, "?"); return FALSE;
+}
+
+static void describe(DWORD addr, char* out, size_t cb) {
+    out[0] = 0;
+    HMODULE h = modOf(addr);
+    if (!h) { snprintf(out, cb, "0x%x", addr); return; }
+    char nm[64]; moduleName(h, nm, sizeof(nm));
+    DWORD rva = addr - (DWORD)h;
+    char tag[96] = {0};
+    if (_stricmp(nm, g_exe_name) == 0 || strstr(nm, "FC3")) {
+        if (rva == 0x00cf6790) strcpy(tag, " [RVCreateGameSession]");
+        else if (rva == 0x00cf6690) strcpy(tag, " [RVJoinGameSession]");
+        else if (rva >= 0x010620400 && rva < 0x010623500) strcpy(tag, " [UPLAY-party-glue-region]");
+        else if (rva == 0x0113409d0) strcpy(tag, " [LOADER-FUN_113409d0]");
+    }
+    snprintf(out, cb, "%s+0x%x%s", nm, rva, tag);
+}
+
+static BOOL isInterestingModule(HMODULE h) {
+    char nm[64]; if (!moduleName(h, nm, sizeof(nm))) return FALSE;
+    return strstr(nm, "FC3") || _stricmp(nm, g_exe_name) == 0 || strstr(nm, "uplay") ||
+           strstr(nm, "upc_") || strstr(nm, "RendezVous") || strstr(nm, "orbit") || strstr(nm, "Orbit");
+}
+
+// ------------------------- per-request orbit trampolines --------------------
+// Layout: [mov eax, imm32=real; jmp orbitLoggedThunk] per request so the logger
+// knows WHICH real function pointer belongs to this call site.
+typedef int (__thiscall_or_unknown)(void);
+typedef int (*fn_orbit_real)(DWORD interfaceId, DWORD a0, DWORD a1, DWORD a2, DWORD a3,
+                             DWORD a4, DWORD a5, DWORD a6, DWORD a7,
+                             DWORD a8, DWORD a9, DWORD a10, DWORD a11);
+
+static fn_orbit_real g_this_real = NULL; // set atomically by trampoline before entering logger
+
+static int __cdecl orbitLoggedBody(DWORD interfaceId, DWORD* args, int nargs,
+                                   fn_orbit_real real, DWORD callerRet);
+
+static void __declspec(naked) orbitLoggedThunk(void) {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        // stack: [ebp+8]=interfaceId, args follow from ebp+0xC (max 12)
+        sub  esp, 4*12
+        pushad
+        // build args array on stack
+        lea  edi, [ebp-4*12]          // dest
+        lea  esi, [ebp+0xC]           // src args
+        mov  ecx, 12
+        rep  movsd                     // copies 12 DWORDs (may read beyond callee's args, guarded? no: our own frame) -> do guarded copy
+        popad
+        // call orbitLoggedBody(interfaceId, args, 12, real, retaddr)
+        mov  eax, [ebp+0x1C+4*0]      // placeholder, recomputed below
+        leave
+        ret
+    }
+}
+// NOTE: naked thunk above is intentionally replaced at runtime by generated code
+// (see makeTrampoline). We keep a C-level logger and emit raw machine code instead.
+
+static volatile LONG g_last_real_lock = 0;
+
+static int __cdecl orbitLoggedBody2(DWORD trRealLoUnused) { return 0; }
+
+// We generate:
+//   55              push ebp
+//   8B EC           mov ebp, esp
+//   60              pushad
+//   8D 7D 0C        lea edi,[ebp+0Ch]   ; first arg
+//   81 EC 00 30 0000 sub esp, 0x3000? no -> keep simple: fixed 12-DWORD buffer
+// Simplest robust approach: fixed prologue pushing 12 args into a static TLS slot is
+// overkill for a menu-path trace. Final design below.
