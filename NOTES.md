@@ -181,3 +181,3745 @@ Observed 2026-10-22 on the owner's PC:
 - **Result:** the host loads `coop_vidar` (the world is visible behind the menu); the client appears to join and shows the same screen. Both then show an empty dark panel without text or buttons; the picture stops updating (mouse cursor trails), input does nothing. After pressing an "OK" button on the host it looks the same. Same with DX9 and DX11, with and without RivaTuner (RTSS) overlay.
 - **Not a hang:** both processes respond to Windows; the main thread uses one core and keeps running different game code and driver calls (`scripts\thread_eips.ps1` samples thread EIPs and scans the stack for `FC3*.dll` addresses).
 - **Suspects / next:** (1) the test-only third-party `multimain.feu` from mod 262 in our `patch.dat` breaks the network menu UI: retest with the patched DLL and the vanilla `patch.dat`; (2) a lobby screen (character select / ready) that waits for something from the missing online services; (3) analyse `FC3_d3d11.dll` in REA and map the main-thread stack addresses (e.g. `0x10338ad4`, `0x102f1b1d`, `0x103e07db`, `0x1040aaa3`, `0x10327bbd`).
+
+
+---
+
+## Session notes appended 2026-11-02 (agent session on the owner's PC)
+
+Sections below were written in the agent session on the owner's PC. Their Phase 1 material
+is not duplicated here: this file keeps the owner's granular Phase 1 sections as the
+authoritative Phase 1 record. Paths in the appended sections are relative to this repo
+(`scripts/` for analysis scripts, `local/` and `local/scratch/` for gitignored state).
+
+## Phase 2 findings (2026-11-01, FC3.dll binary analysis)
+
+**Network stack: Storm (Ubisoft)** — confirmed in FC3.dll strings:
+- `storm echo` — session management (Create, ChangeSessionDescription, SessionTicket)
+- `storm punch` — NAT traversal (ClientImplMainInitParams, ClientImplNetworkInitParams, detectNat, qos punch/traversal)
+- `storm echo` — player events: RequestJoin, AcceptJoinRequest, RefuseJoinRequest, RequestAddPlayer, RemovePlayer, UpdatePlayer
+- `AcceptSessionHostCandidacy` / `RefuseSessionHostCandidacy` — host election
+- `BroadcastLanDiscovery2` — LAN discovery via UDP broadcast
+- `Host disconnected starts host migration` — host migration supported
+- `Listening on host port` — server listen
+- `WS2_32.dll` — Winsock import confirmed
+- `-dedicated` flag — dedicated server mode exists
+- `dedicatedConfig`, `NumPlayers`, `SessionId`, `IsDedicated`, `MapSource`
+
+**Co-op entities in engine:**
+- `CSpawnPointCoop`, `CLocalSpawnPointCoopEntity` — co-op-specific spawn points
+- `CSpawnPointMP`, `CSpawnPointBlue`, `CSpawnPointRed`, `CSpawnPointShared` — MP spawn types
+- `CGRQueryIsCoopGame` — co-op game mode query
+- `FCXCoop` — co-op game mode identifier
+
+**Lobby/session infrastructure:**
+- `CLobbyService`, `CNetGameCtrlEnterLobby`, `CNetGameCtrlStateUpdateLobby`
+- `CSessionSendInviteOperation`, `CSessionAcceptInviteOperation`, `CSessionCancelInviteOperation`
+- `CVotingService`, `CPlaylistService`
+- `CFCXGRStateLobby` — co-op lobby state
+- Connection states: `ResolvingAddress`, `Reaching`, `Connected`, `Dropped`, `Deleted`
+- Error states: `CONNECTION_FAILED`, `CONNECTION_TIMED_OUT`, `KICKED`, `BANNED`, `SESSION_JOIN_TIMED_OUT`, `REFUSED`, `MIGRATION`
+
+**Game modes in FC3.dll:**
+- `Singleplayer.feu`, `Multiplayer` menu, `QuickLaunch.feu`
+- `frontendworld`, `multicommon` — world references
+
+**Conclusion:** The engine has a complete co-op infrastructure (Storm netcode, session management, LAN discovery, host migration, spawn points). The `-host`/`-client` flags and session type 3 (co-op story) should work. The "not enough players" check at `0x108c4b09` is the main gate to bypass for solo/offline play.
+
+## Startup / command-line behaviour of the Uplay 1.06 build (2026-11-01)
+
+Verified on the owner's machine: `H:/Uplay/Far Cry 3/bin` = Uplay build 1.06 (version number is NOT
+readable from PE resources; build identity below is re-verified with
+`scripts/fc3_version_probe.py` / `scripts/fc3_rsrc_probe.py` on 2026-11-01.
+
+| file | bytes | sha256 (short) | PE TimeDateStamp |
+| --- | --- | --- | --- |
+| `bin/FC3.dll` | 40720424 | `71d58a7a4503c5c6…` | 2022-10-03T12:21:31 |
+| `bin/FC3_d3d11.dll` | 40869416 | `e541594e11ac6091…` | 2022-10-03T09:36:32 |
+| `bin/farcry3_d3d11.exe` | 203816 | `5437b2e37a54f8a3…` | 2022-10-03T09:37:26 |
+| `bin/farcry3.exe` | 203816 | `fd3929f19ff82591…` | 2022-10-03 |
+
+`H:/Uplay/Far Cry 3/bin` and `H:/FarCryCoop/TestFC3/bin` are byte-identical (16 entries, no
+`FC3_coop*` files).
+
+**Correction (2026-11-01): the numbers in the earlier version of this section were wrong.** The old
+text claimed PE compile time 2022-05-04, an exe size of 60992 bytes, file version 1.06.0.90512 and
+product 1089053420, and MD5 `916c6d4b876d8be5f0ad68f50719a838` (FC3_d3d11) /
+`5742de2aaa76935d46947bf89e2e2eb7` (FC3) / `47d4c992b0e82b7d52cc48e8d1bd9119` (farcry3_d3d11.exe).
+The compile time is 2022-10-03, the exe is 203816 bytes, and **none of these binaries contain a
+version resource** (`VS_VERSION_INFO` is absent; the only `FileVersion` hit is the
+`GetFileVersionInfoA` import name) — so `1.06.0.90512` is not derivable from the PE files. The MD5
+list may belong to a different (1.05) build; the sha256 values in the table above are what this
+machine has. Bantila's recorded 1.05 `FC3.dll` SHA-256
+`493031278308793D841F7419C83A447678651860312F56506A0A18B2A70D19E5` matches nothing here.
+No 1.05 build exists anywhere on the disks (%USERPROFILE%/Downloads, Desktop, D:/, E:/, H:/).
+
+- **The exe is a DRM stub.** `bin/farcry3_d3d11.exe` (203816 bytes; PE32, EP `0x000012de`,
+  base `0x00400000`, `.text` 2138 B, `.rsrc` 187880 B, imports: `FC3_d3d11.dll` **1 function**,
+  `MSVCR100.dll` 24, `KERNEL32.dll` 17 — no `GetCommandLine*`, no `CreateProcess*`, no `ShellExecute*`)
+  starts, then re-executes the
+  **canonical install** exe resolved from the registry
+  (`HKLM\SOFTWARE\WOW6432Node\Ubisoft\Far Cry 3`: `InstallDir=H:/Uplay/Far Cry 3`,
+  `ExecutableName=bin/FC3Updater.exe`, SKU=WW, Version=1.05, Language=Russian), passing only
+  `-language=Russian`. Every extra argument is dropped.
+- Consequence for the test copy: launching `H:/FarCryCoop/TestFC3/bin/farcry3_d3d11.exe` with
+  `-host fc3_main -login h1 -coop` starts a child from `H:\Uplay\Far Cry 3\bin` with
+  `-language=Russian` only. The test copy cannot run its own quick-launch.
+- The quick-launch strings ARE present in 1.06 (`FC3.dll` command-line table `0x1fb6f6c`-
+  `0x1fb74f6`): `-host` @0x1fb73cb, `-client` @0x1fb7472, `-login` @0x1fb7370, `-coop` @0x1fb73fc,
+  `-offline` @0x1f36444, `-sessionuid` @0x1fb73e4, `-dedicated` @0x1f0d9dc,
+  "Missing -login or -ip" @0x1fb7458.
+  **Those offsets do not match the binary on this machine.** They look like raw-file offsets, but
+  `0x1fb73cb` is outside the `.text` raw range of the installed `FC3.dll` (`.text` rawptr `0x400`,
+  rawsize `0x1BC2000`; `.rdata` VA `0x11bcb000` rawptr `0x1bca200`; conversion
+  `VA = 0x10001000 + (raw - 0x400)` for `.text`, `VA = 0x11bcb000 + (raw - 0x1bca200)` for `.rdata`).
+  Verified string addresses on the installed 1.06 `FC3.dll` (`scripts/fc3_iat_scan.py`,
+  `scripts/fc3_cmdline_cluster.py`): `-host` `0x11f0e6ac`, `-client` `0x11f0e748`, `-dedicated`
+  `0x11f0e7dc`, `-login` `0x11fb8170`, `-sessionuid` `0x11fb81e4`, `-coop` `0x11fb81fc`, `-online`
+  `0x11fb8234`, `-ip` `0x11fb8254`, `-bfname` `0x11fb7d64`, `-offline` `0x11f37244`.
+  Installed `FC3_d3d11.dll`: `-host` `0x11f31c7c`, `-client` `0x11f31d18`, `-dedicated` `0x11f31dac`,
+  `-login` `0x11fdc040`, `-sessionuid` `0x11fdc0b4`, `-coop` `0x11fdc0cc`, `-online` `0x11fdc104`,
+  `-ip` `0x11fdc124`, `-bfname` `0x11fdbc34`, `-offline` `0x11f5a654`.
+  What is **absent** in 1.06: the 1.05 debug-menu strings
+  "Not enough players", "Local Coop", "Coop Story".
+- **Resolved (2026-11-05, re-verified with `scripts/fc3_mode_cascade.py`): the mode-flag cascade.**
+  The cascade is a chain of `push <flag string>` / `push esi` / `call edi` (`strstr`), `add esp,8`,
+  `test eax,eax`, `je <next flag>`; a match reads a **static mode id** global into `[ebp+8]`.
+- **Cascade body location (FC3.dll): `0x11a8c440`**
+  (`push ebp` / `mov ebp,esp` / `sub esp,0x2c` / `push ebx` / `mov ebx,[ebp+0x14]` /
+  `mov esi,[ebp+0xc]` / `push edi` / `mov edi,[0x11bcb5c0]` = `MSVCR100.dll:strstr`). The previously
+  recorded range `0x11a8c533 .. 0x11a8c567` is a fragment of this body.
+- **Flag order and match sites (FC3.dll, `0x11a8c440 .. 0x11a8c5b1`):** `-login` `0x11a8c455`,
+  `-ip` `0x11a8c464`, `Missing -login or -ip for -client.` `0x11a8c476`, `-online` `0x11a8c49d`,
+  `-password` `0x11a8c4ac`, `Trying to launch an online client, but missing password (-password)`
+  `0x11a8c4be`, `-ip` `0x11a8c4f0`, `-bfname` `0x11a8c4fe`, `-sessionuid` `0x11a8c50c`,
+  `-deathmatch` `0x11a8c51a` (reads `[0x1216aedc]`), `-coop` `0x11a8c533` (reads `[0x1216aee4]`),
+  `-domination` `0x11a8c54d` (`[0x1216aeec]`), `-headquarters` `0x11a8c567` (`[0x1216aef4]`),
+  `-firestorm` `0x11a8c57d` (`[0x1216aefc]`), `-dash` `0x11a8c597` (`[0x1216af04]`), fallback
+  `[0x1216af0c]` at `0x11a8c5b1`.
+- **Mode-id values (FC3.dll `0x1216aed0 .. 0x1216af10`, byte-identical to FC3_d3d11.dll
+  `0x1218ffd0 .. 0x12190010`):** `0x9ba82025` first entry (`0x1216aed0` and `0x1216aed4`),
+  `-deathmatch 0x8b40f692`, `-coop 0x43521e6f`, `-domination 0xab4fc8e2`, `-headquarters 0x9991daec`,
+  `-firestorm 0xf66ffb87`, `-dash 0x2100ced7`, default `0x6c2b3868`; each id is followed by a
+  `0xffffffff` pair word, and an extra id `0xd2fd0a6b` sits just before the block (`0x1216aecc` /
+  `0x1218ffcc`). Two corrections to the earlier note: `-deathmatch` reads `0x1216aedc` (not
+  `0x1216aed4`), and the id recorded as "unknown" (`0xf66ffb87`) is **`-firestorm`**.
+- **The cascade reads the ids, it does not write them:** the values are static `.data`
+  initializers present in both 1.06 modules, so `-coop` is a live mode id, not a stripped string.
+  `-online` is a separate selector: `[ebp-0xc]` is set to `3` at `0x11a8c5bf` by default and to `2`
+  at `0x11a8c5cf` when `-online` matches (consistent with the host-model finding "session type = 3
+  without `-online`").
+- **Consumer of the cascade id (FC3.dll `0x11a8c5d6 .. 0x11a8c5f0`):** `mov ecx,[ebp+8]` →
+  `mov edx,[ebx]` → `mov eax,[edx+0x14]` → **`mov [ebx+0xa4],ecx`** (the mode id lands in object
+  field `+0xa4`) → `mov ecx,ebx` / `call eax`, then `mov eax,[edx+0x18]`, `mov ecx,ebx`, `call eax`.
+  FC3_d3d11.dll mirrors the chain (`-domination` `0x11aa08ed`, `-headquarters` `0x11aa0907`,
+  `-firestorm` `0x11aa091d`, `-dash` `0x11aa0937`, `-online` `0x11aa0959`) and the `+0x14` dispatch
+  at `0x11aa0976`.
+- **What the cascade function does after the id is set (`FC3.dll 0x11a8c5f0 .. 0x11a8c6b9`,
+  `local/scratch/cascade_tail.txt`):** it calls `0x119696d0` (`0x11a8c5f7`) and `0x11a8bdc0`
+  (`0x11a8c601`), runs a ref-count block built from `[ebx+0x9c] + 0x4c` and `[ebp+0x14]` (`cmp`
+  `0x11a8c612`, `lock xadd [edx], 1` `0x11a8c62d`, `lock xadd [edx], -1` `0x11a8c645`,
+  `call 0x100945e0` `0x11a8c64f`), sets a byte flag `[ecx+0xd] = 1` (`0x11a8c668`), reads the string
+  global `-sessionuid` `0x11fb81e4` (`0x11a8c696`), then writes launch-record fields
+  `[ebx+0x64] = 0xfffffffd` (`0x11a8c69c`), `[ebx+0x40] = eax` (`0x11a8c6a3`), `[ebx+0x44] = edx`
+  (`0x11a8c6a6`) and `[ebx+0x74] = 6` (`0x11a8c6b2`). The mode id travels inside a
+  vtable-dispatched object; no record is registered from this path.
+- **`+0xa4` census (`FC3.dll .text` walk with `local/scratch/probe5.py`, output
+  `local/scratch/a4sites.txt` 93637 bytes):** 832 functions touch a `[reg+0xa4]` slot (835 refs) but
+  exactly one also touches a mode-id global, `0x1181c440`, and that one turned out to be UI code (next
+  bullet). `+0xa4` is not a unique fingerprint of the launch mode, so the consumer search must follow
+  the vtable dispatch instead.
+- **Dead end: `FC3.dll 0x1181c440` is a FlowGraph UI handler named `customMapEvaluation`.** Its `+0xa4`
+  refs are stack slots (`mov [esp+0xa4],4` `0x1181d09e`, `mov [esp+0xa4],0x190` `0x1181d101`); the body
+  loads its name `mov esi, 0x1201b27c` (`0x1181c45b`, a UTF-16 string right after the `CFCX` fourcc at
+  `0x1201b276`); `scripts/fc3_callers.py` reports `0 E8 callers` plus one absolute data ref at
+  `0x1201b444`, which sits in a handler table `0x1201b404 .. 0x1201b458` surrounded by `OnMapPublish`
+  `0x1201b380`, `OnEnterMyMapsOK` `0x1201b39c`, `OnEnterMapArchiveOK` `0x1201b3bc`, `ExitMyMaps`
+  `0x1201b3e4`, `updateCustomMapEvaluation` `0x1201b478`, `multiCustomMapEvaluationReportContent`
+  `0x1201b4b0`, `multiCustomMapEvaluationFavoriteContent` `0x1201b500`,
+  `multiCustomMapEvaluationLikeContent` `0x1201b550`, `customMapEvaluationTagsRequest` `0x1201b598`.
+- **Registry-shaped loop found inside that handler (`0x1181ceef .. 0x1181cf30`), kept because it is the
+  pattern a real session registry would show** (listing saved to `local/scratch/registry_scan_loop.txt`):
+  `mov ecx,[0x128048c0]` (`0x1181ceef`), `mov edi,[edx+0xc4]` (`0x1181cef5`), `mov eax,[ecx+8]`
+  (`0x1181cefb`), `mov edx,[ecx+4]` (`0x1181cefe`), `lea edx,[edx+eax*4]` (`0x1181cf01`),
+  `mov eax,[ecx+4]` (`0x1181cf04`), `cmp eax,edx` (`0x1181cf07`), `je 0x1181cf21` (`0x1181cf09`),
+  then the scan `mov ebx,[eax]` (`0x1181cf11`) → `cmp dword ptr [ebx+0x20], esi` (`0x1181cf13`) →
+  `je 0x1181cf1f` (`0x1181cf16`) on a match, `add eax,4` (`0x1181cf18`) → `cmp eax,edx`
+  (`0x1181cf1b`) → `jne 0x1181cf11` (`0x1181cf1d`) on a miss; `xor ebx,ebx` (`0x1181cf1f`) is reached
+  from both the match jump and the exhausted loop, and `0x1181cf21` (`mov edx,[ecx+8]`,
+  `mov ecx,[ecx+4]`, `lea edx,[ecx+edx*4]`, `cmp eax,edx`, `je 0x1181cf35`, `mov eax,[eax]`) starts a
+  second scan of the same container. `esi = [0x1216aeec]` (`-domination 0xab4fc8e2`, read at
+  `0x1181cf0b`), `edi = [0x1216af0c]` (default `0x6c2b3868`, read at `0x1181ce50`), and the field
+  compared on the other side is `[edx+0xc4]`.
+ New container: **`[0x128048c0]`**, `+4` = count, `+8` = index base scaled ×4, entries
+  are pointers whose field `+0x20` holds an id — distinct from the execLines container `[0x12829424]`.
+  Open: what `[0x128048c0]` is, and whether the cascade's `+0xa4` value is ever matched against an
+  entry's `+0x20`.
+- **Consumers of the launch-mode id located** (whole-`.text` scan of every instruction that reads a
+  mode-id global, dump in `local/scratch/modeid_sites.txt`: only 3 functions read them in `FC3.dll`):
+  `0x1111e390` (`cmp eax,[0x1216aee4]` at `0x1111e4e3`), `0x1111e860` (`cmp eax,[0x1216aee4]` at
+  `0x1111e91e`), `0x1181c440` (default id at `0x1181ce50`, `-domination` at `0x1181cf0b`). In
+  `0x1111e390`: `mov eax,[edi+0x10]` (`0x1111e399`) holds the mode id, `mov ecx,[ebx+0x154]`
+  (`0x1111e3bc`) is the container it searches, `call 0x10260770` (`0x1111e3c7`) is the id→record lookup
+  (`cmp byte ptr [ecx+0x5c],0` `0x10260773`, `cmp dword ptr [ecx+0x54],0` `0x1026077b`,
+  `mov eax,[ecx+0x50]` `0x10260781`, `call 0x1025fee0` `0x1026078a`, `cmp dword ptr [eax+4],2`
+  `0x1026079a`, `cmp ecx,[edi+0xc]` `0x102607a3`, returns the record or 0), and the record's field
+  `+0xcc` (`0x1111e3d8` `mov eax,[eax+0xcc]`) yields the container the record belongs to.
+- **The coop test reads through a second singleton (`FC3.dll 0x1111e4ce .. 0x1111e517`)**:
+  `mov edx,[0x12804acc]` (`0x1111e4ce`) → `mov eax,[edx+0x68]` (`0x1111e4d4`) → `mov eax,[eax+0x30]`
+  (`0x1111e4db`) → `or eax,0xffffffff` when the accessor is null (`0x1111e4e0`) → `cmp eax,[0x1216aee4]`
+  (`0x1111e4e3`) → `mov ecx,[ebx+0x154]` (`0x1111e4ef`) → `mov eax,[ecx]` → `mov eax,[eax+0x68]` →
+  `call eax` with `[esp+0x18]` (`0x1111e4fe`) → `mov eax,[edx+0x24]` (`0x1111e508`) → `call eax`
+  (`0x1111e50b`) → `test al,al` → `cmp byte ptr [esp+0xb],al` → `cmp dword ptr [0x12835c94],0`
+  (`0x1111e517`). New globals: **`[0x12804acc]`** (accessor at `+0x68`, vtable slots `+0x30` and `+0x24`)
+  and **`[0x12835c94]`**.
+- **The same coop test appears a second time inside `0x1111e860` (`FC3.dll 0x1111e860 .. 0x1111ecb0`,
+  dump `local/scratch/r1_out.txt`)**: `mov eax,[0x12804acc]` (`0x1111e902`) → `mov eax,[eax+0x68]`
+  (`0x1111e907`) → `mov eax,[eax+0x30]` (`0x1111e916`) / `or eax,0xffffffff` (`0x1111e91b`) →
+  `cmp eax,[0x1216aee4]` (`0x1111e91e`) → `sete al` (`0x1111e924`) → `mov byte ptr [esp+0x13],al`
+  (`0x1111e927`) → `test al,al` → `jne 0x1111e98e` (`0x1111e92d`); the negative branch tests
+  `cmp dword ptr [ecx+0xc],0` (`0x1111e932`), `cmp dword ptr [0x12835c94],0` (`0x1111e938`),
+  `call 0x10003cd0` (`0x1111e94a`), `call 0x10002aa0` (`0x1111e961`), `call 0x10425d20`
+  (`0x1111e96e`, `cmp eax,ebx` → `je 0x1111e98e`), `mov ecx,[0x12805434]` (`0x1111e97f`),
+  `call 0x11363ab0` (`0x1111e985`). Shared shape of both functions: `mov ebx,[ebp+8]` + `add ebx,0x108`
+  (`0x1111e8ad`) or `mov ecx,[ebx+0x154]` (`0x1111e3bc`, `0x1111e437`) as the searched container,
+  `call 0x10425d20` (`0x1111e8b8`, `0x1111e96e`) with the `cmp eax,ebx` end-of-container sentinel, entry
+  field read `mov eax,[eax+0x20]` (`0x1111e8c5` — the same `+0x20` id field as the `[0x128048c0]`
+  entries), `mov ecx,[0x12805434]` (`0x1111e8c8`), `call 0x11363b10` (`0x1111e8de`),
+  `cmp dword ptr [ebp+0x14],2` (`0x1111e98e`) and `cmp dword ptr [ebp+0x14],1` (`0x1111ea44`) as the
+  mode selector, `call 0x104245c0` (`0x1111e9a5`), and the final gate `mov ecx,[0x12805180]`
+  (`0x1111ea72`) → `mov eax,[ecx+4]` (`0x1111ea78`) → `mov edx,[eax+0x11c]` (`0x1111ea7b`) →
+  `mov ecx,[eax+0x118]` (`0x1111ea81`) → `push edx; push ecx; push eax` → `call 0x102000d0`
+  (`0x1111ea8a`) → `test al,al` → `je 0x1111eb48` (`0x1111ea91`). Open: what `[0x12805180]`,
+  `[0x12805434]`, `0x102000d0`, `0x10425d20` are, and who calls `0x1111e390`/`0x1111e860`.
+- **Container `[0x128048c0]` owner (`local/scratch/container_sites.txt`, 13 functions)**: creator
+  `0x10048230` publishes it twice (`0x10048289`, `0x10048297 mov dword ptr [0x128048c0], eax`); readers
+  `0x10f0c770` `0x10f0c7ca`, `0x10f0ea50` `0x10f0ec39`, `0x10f0ed30` `0x10f0ef19`, `0x113224c0`
+  `0x11322514`, `0x113235d0` `0x113236a9`, `0x11340560` `0x113408f8` + `0x11340bdb`, `0x11709440`
+  `0x11709450`, `0x1181c440`, `0x118227d0` `0x11822875`, `0x119288b0` `0x11928dee`, `0x11997720`
+  `0x11997723` (that read is the function's first instruction, so it looks like a getter). Creator
+  anatomy: guards `cmp byte ptr [0x128042fc], bl` (`0x1004823a`) and `cmp byte ptr [0x12162beb], bl`
+  (`0x10048247`), `call 0x11789a00` (`0x10048242`), 0x20-byte allocation `mov edx,0x10` /+ `lea
+  ecx,[edx+0x10]` / `call 0x1177f7c0` (`0x1004824f`, `0x10048254`, `0x10048257`), vtable `mov dword ptr
+  [eax], 0x11f224c4` (`0x10048271`), fields `+4 +8 +0xc +0x10 +0x14 +0x18` zeroed.
+- **`[0x128048c0]` vtable `0x11f224c4` gates its slots on flag bits of `+0x10`** (dump in
+  `local/scratch/probe8.py` output): slot 1 `0x100a5df0` (`test byte ptr [ecx+0x10],1` `0x100a5df3`,
+  `mov esi,[ecx+0x14]`, `add esi,[ebp+8]`, `cmp dword ptr [ecx+8],-1`, `lea eax,[ecx+4]`,
+  `mov eax,[edx+0x20]` → `call eax` at `0x100a5e14`), slot 2 `0x100a5e30` (bit 2), slot 3 `0x100a5e70`
+  (bit 4); slot 0 `0x100a5b10` bounds-checks `esi` against `[0x121bbff8]` (`0x100a5b25`) and
+  `[0x121a7fdc]` (`0x100a5b2d`) after `call 0x117097d0`.
+- **Mode ids occur in three other FC3.dll data tables** (the next candidates for the
+  session-descriptor registry): `0x1216aa2c .. 0x1216aa44` (`-deathmatch 0x1216aa2c`, default
+  `0x1216aa30`, `-firestorm 0x1216aa34`, `-domination 0x1216aa38`, `-headquarters 0x1216aa3c`,
+  `-coop 0x1216aa40`, `-dash 0x1216aa44`); `0x12173ff0 .. 0x1217400c` (`-domination 0x12173ff0`,
+  `-coop 0x12173ff4`, `-deathmatch 0x12173ff8`, `-headquarters 0x12174000`, `-firestorm 0x12174008`,
+  `-dash 0x1217400c`, default `0x12173ffc`); a `-coop`/`-dash` pair at `0x1216a00c` / `0x1216a010`;
+  `0x9ba82025` repeats through `0x12163450 .. 0x121636e8`; `0xd2fd0a6b` also at `0x1216cab0`.
+  Open: what each table selects and who iterates them.
+- **Second mode-name comparison chain (FC3.dll) at `0x11a8c944 .. 0x11a8c9c1`** (function start now
+  `0x11a8c8b0`, see the item at the end of this file) (`-deathmatch`
+  `0x11a8c944`, `-coop` `0x11a8c95d`, `-domination` `0x11a8c977`, `-headquarters` `0x11a8c991`,
+  `-firestorm` `0x11a8c9a7`, `-dash` `0x11a8c9c1`); `-online` also has refs at `0x11a8b8d3`,
+  `0x11a8b91f`, `0x11a8cd09`. Open: what this chain selects.
+- **Reloc-mode site counts for the mode-id and container globals (`scripts/fc3_reloc_xref.py
+  --mode reloc`, 772159 entries per module).** The `-coop` mode-id global FC3.dll `0x1216aee4` has **30**
+  sites whose stored value points at it, and FC3_d3d11.dll `0x1218ffe4` has the same **30**; the mode-name
+  string has **2** in each module (FC3.dll `0x11fb81fc` -> `0x11a8c534`, `0x11a8c95d`; FC3_d3d11.dll
+  `0x11fdc0cc` -> `0x11aa08d4`, `0x11aa0cfd`). FC3.dll accessor base `0x1282f6cc` has **4** HIGHLOW sites
+  (`0x1199cdcb`, `0x1199cddd`, `0x1199cf76`, `0x11bb33f1`) while the container global `0x12829424` has
+  **0**: it is reached only through `disp32` accesses, which the loader never patches, so the 17 502 hits
+  recorded above come from the byte-pattern scan, not from `.reloc`. Full site lists are kept in
+  `local/scratch/xref_sites_fc3.txt` and `local/scratch/xref_sites_d3d11.txt`.
+- **Lesson (2026-11-05): the mode ids are not `hash(name)`.** Recomputing `-deathmatch`, `-coop`,
+  `-domination`, `-headquarters`, `-firestorm`, `-dash` and the default mode name with FNV-1a, FNV-1,
+  djb2, sdbm, ELF and CRC32 (in the 26 name variants already tested) gave **0** matches in either module,
+  so the ids are constants in a game table, not values derived from the flag strings.
+- **Lesson (2026-11-05): `scripts/fc3_reloc_xref.py` code mode cannot see `push imm32`.** For the two
+  `push <mode-name VA>` sites inside the cascade body, code mode printed `verified instructions: 0` and
+  `rejected (no instruction ends at the field): 2`, while `--mode reloc` found both sites: for
+  `push imm32` arguments only the reloc mode is reliable.
+- Open: whether the co-op id reaches the session-descriptor registry.
+- Renaming `bin/upc_r1_loader.dll` does not free the stub: the game exits silently ~25 s after
+  launch (no window, no WER event) — the Ubisoft Connect loader is a hard start-up dependency.
+- `HKLM` writes are not available to the current user (not elevated), so the registry cannot be
+  redirected to a private copy. `local/registry-fc3-backup.reg` holds the original values.
+- What 1.06 keeps usable: the single-instance mutex patch (`jnz` at `0x100041bb` / `0x10004092`
+  -> NOPs) lets two copies run side by side; the Uplay party-list crash patch is 1.05-only (the
+  pattern does not occur in 1.06, new UPC API).
+- The 1.06 multiplayer menu is dead: it shows the hard-coded loc id `0x23894` = 145556 =
+  `X360_EU_NETWORK_XLSP_DOWN` dialog (line 152 of the upper-fork notes, see
+  `D:/Projects/Co-op Anything/FarCry3Coop-bantila/NOTES.md`). A quick-launch must therefore
+  bypass the menu, not navigate it.
+- **New lead (2026-11-01): the 1.06 exe already has an exec-line mechanism.** In `FC3_d3d11.dll`
+  the launcher function `0x11aa2fe0` (called from `0x117b7003`, i.e. from the start-up routine that
+  also tests `-language`, `-editorpc`, `-affinity`, `-floatexceptions`, `-host`, `-norender` and
+  opens the single-instance mutex at `0x117b6f3e`) reads `-bfname` `0x11fdbc34`, **`-execline`
+  `0x11fdbc3c`**, **`-exec` `0x11fdbc48`**, **`-quickstartup` `0x11fdbc50`** and then pushes the console
+  variables `gfx_NoLaunchCountdown 1` `0x11fdbc60`, `gfx_NoPostRoundCountdown 1` `0x11fdbc78`,
+  `gfx_NoPreRoundTimeOut 1` `0x11fdbc94`.
+  Hypothesis (untested): feed the co-op quick-launch arguments through `-execline "…"` / `-exec "…"`
+  instead of patching the Uplay relaunch. Open questions: which import sits at IAT slot `0x11be1618`
+  (the switch-test helper), what the consumer of `-execline` at call `0x11a1b940` does, and the
+  `FC3_d3d11.dll` equivalent of the indirect-call pointer `0x11bcb5c0`.
+- Uplay side evidence (`C:/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/logs/launcher_log.txt`):
+  the hub is invoked as `uplay://launch/46/0` and then as
+  `-upc_uplay_id 46 -upc_desktop_mode -offline -upc_game_starter -exec "video_setmode 1280 720 0"`,
+  i.e. Ubisoft Connect itself passes an `-exec "…"` line to the game stub. Every launch line is
+  followed by `HubUtils.cpp (208) Test/dev args file present.` — the file that line refers to is
+  **not identified**; finding it would be a second way to inject arguments without patching.
+  `data/46/` is empty, `cache/configuration/configurations/` is empty, `games/` is empty, and no cfg
+  under the launcher tree contains `video_setmode` (only the log does).
+- **Prior-art addresses transfer to the installed 1.06 `FC3.dll` (verified 2026-11-01).** Anchors
+  found independently in `H:/Uplay/Far Cry 3/bin/FC3.dll` match `D:/Projects/Co-op Anything/FarCry3Coop-bantila/NOTES.md`
+  exactly: `GetLocalPlayerId` `0x11fbdcc4` (push site `0x111ce912`), `TeleportToCurrentObjective`
+  `0x11fbda7c` (push site `0x111cdf76`), `SpawnCoopAI` `0x1206ad0c` (push site `0x11b1da06`), `CoopTeleportPlayer`
+  `0x1206a994` (push site `0x11b1d252`), Lua-function table `0x11b1d252`..`0x11b1df2e`, session-operation parameter registration
+  `FUN_11342740` (called at `0x113429a0`). Caveat: bantila's *REA* snapshot labelled `fc3-105-FC3.dll`
+  uses different VAs (`GetPlayerInSlot 0x10bad843`, `GetNumberOfPlayers 0x10baba48`, …), so that second
+  build is a different file; the Ghidra pass in NOTES lines 55-72 is layout-identical to this 1.06 file.
+- **1.06 command line / console-command mechanism (`FC3_d3d11.dll` launcher func `0x11aa2fe0`).** The
+  switch test is `push <string>; call dword ptr [0x11be1618]` = `MSVCR100.dll:strstr`, so the game DLL
+  parses its own command line. Switch strings: `-execline` `0x11fdbc3c`, `-exec` `0x11fdbc48`,
+  `-quickstartup` `0x11fdbc50`, `-bfname` `0x11fdbc34`; `-numclients` `0x11fb1e18`, `-splitscreen`
+  `0x11f31d75`, `-splitscreen4` `0x11f31d85`, `-world` `0x11fdbf80`, ` -world=fc3_main` `0x11fdbdb1`,
+  `optimal_splitscreen` `0x11f76040`, `execLines` `0x11fb4a80`. Value-extraction helper `0x11a1b940`
+  (called at `0x11aa3082`, `0x11aa3170`), tokenizer `0x10001e40`, `strchr`-like helper `0x10037dc0`.
+  Full contiguous switch block verified by byte search in BOTH 1.06 files (`FC3_d3d11.dll` / `FC3.dll`):
+  `-nocompile` `0x11fdbbd8`/`0x11fb7d08`, `-runscriptindebug` `0x11fdbbe4`/`0x11fb7d14`,
+  **`-disableplayersetuponquicklaunch`** `0x11fdbbf8`/`0x11fb7d28`, `-perfhud` `0x11fdbc1c`/`0x11fb7d4c`,
+  `-logFile` `0x11fdbc28`/`0x11fb7d58`, `-bfname` `0x11fdbc34`/`0x11fb7d64`, `-execline` `0x11fdbc3c`/`0x11fb7d6c`,
+  `-exec` `0x11fdbc48`/`0x11fb7d78`, `-quickstartup` `0x11fdbc50`/`0x11fb7d80`, `-debugFramerateCameras`
+  `0x11fdbcf8`/`0x11fb7e28`, `-demoType` `0x11fdbd80`/`0x11fb7eb0`, `-tracking`/`-trackingextension`/
+  `-forcevip`/`-closedbeta` (only in `FC3.dll`: `0x11fb7e78`, `0x11fb7e84`, `0x11fb7e98`, `0x11fb7ea4`),
+  `-benchmark` `0x11fdbe4c`, `-quickmatch` `0x11fdbe58`, `-load` `0x11fdbe64`, `-wait` `0x11fdbe6c`,
+  `-world` `0x11fdbe80`, `-class` `0x11fdbe88`, `-spawn` `0x11fdbe90`, `-spawnpos` `0x11fdbe98`,
+  `-spawnangle` `0x11fdbea4`, `-map` `0x11fdbeb0`, `-benchmarkinputname` `0x11fdbec4`.
+  A benchmark usage string exists: `Invalid parameters for -benchmark. Ex; -benchmark {playback|record|
+  sectors|spawnpoints|path} -world worldname -map mapname` (`0x11fdbed8` / `0x11fb8008`) — proof that
+  `-world`+`-map` are accepted on the command line. Switches NOT present in 1.06 (exact-string search,
+  both files): `-hostmaster`, `-hostgame`, `-dedicator`, `-profile`, `-quickdebug`, `-demo`, `-devfolder`,
+  `-profilefolder`, `-gametype`, `-gamemode`, `-mapname`, `-mapId`, `-stageName`, `-stageOffset`,
+  `-stageSize`, `-save`, `-log`.
+- FC3.dll 1.06 carries the SAME switch machinery, at its own addresses (verified by byte scan of the
+  little-endian string VA in `.text`) (VA = file offset + 0xc00 for this binary's `.text`): the launcher
+  function spans `0x11a8cf90`..`0x11a8d103`; `-host` `0x11f0e6ac` is referenced at VAs `0x117a6139`,
+  `0x117a6794`, `0x11a8c90c`, `0x11a8cf07`, `0x11a8f657`; `-client` `0x11f0e748` at `0x117a67a2`,
+  `0x11a8cfc3`, `0x11a8f67f`; `-disableplayersetuponquicklaunch` `0x11fb7d28` at `0x11a8c3b0`
+  and `0x11a8e624`. The bytes at those sites are the push immediates (`ac e6 f0 11` / `28 7d fb 11`). FC3.dll's strstr import slot is
+  `[0x11bcb5c0] = MSVCR100.dll:strstr`, used by the validity helper `0x11a8b8c0` which pushes
+  `-online` `0x11fb8234`, `-login` `0x11fb8170` and the error string `'Missing -login or -online for
+  -quickmatch.'` `0x11fb82d8` → the `-quickmatch` handler validates that `-login`+`-online` are present.
+  **This confirms FC3.dll itself contains the multi-player launch-argument validation layer, and the
+  `-quickmatch` route requires `-login` + `-online`.** In `-quickmatch`/`-host` handling
+  (`0x11a8d0c5`..`0x11a8d0eb`): `lea edx,[ebp+8]; call 0x11341dc0` (returns a session-interface object),
+  `mov ecx,[eax]; mov eax,[ecx]; mov eax,[eax+0x74]; push edx; call eax` — a **vftable slot 0x74** call on
+  that object with an out-parameter `[ebp+0x10]`, then `call 0x10005570` (destructor) and `jmp 0x11a8cf90`.
+  The failure path calls `0x11343640`, a destructor that writes the vftable `0x11f90644` (same page as the
+  session-operation field strings `execLines` `0x11f90af0`) and frees the fields at `[obj+0x98]`, `[obj+0x9c]`
+  ⇒ the object IS the session object. So the session-creation call is **vftable slot 0x74** of the object
+  returned by `0x11341dc0` — the exact target a quick-launch/`-exec` route must reach.
+  The collected console lines are `gfx_NoLaunchCountdown 1` `0x11fdbc60`, `gfx_NoPostRoundCountdown 1`
+  `0x11fdbc78`, `gfx_NoPreRoundTimeOut 1` `0x11fdbc94`, `multi_DisableInitialSpawnDelay 1` `0x11fdbcac`,
+  `hack_loadOutIsWaitingForMissionBlocks 0` `0x11fdbcd0`, plus switch-driven extras `starMatch_with_debugCameras 1`
+  `0x11fdbd10` + `multi_SkipIntroMovie 3` `0x11fdbd30` (from `-debugFramerateCameras` `0x11fdbcf8`) and
+  `cheat_GodMode 2` `0x11fdbd8c` (when `-demoType` `0x11fdbd80` equals `StageDemo` `0x11f9a8a0`, compared
+  with `MSVCR100.dll:_stricmp` `[0x11be1390]` at `0x11aa3741`).
+- **Helper identification (corrects this file's earlier claim that `0x10002a50` was a console executor).**
+  Disassembling the callees: `0x10002a50` = **strlen** (aligned zero-byte scan `lea esi,[ecx+0x7efefeff]`
+  … `test esi,0x81010100` … `sub eax,edx; ret`), `0x10001ec0` = SSO `std::string` assign (`add ecx,0xc;`
+  `call 0x10700c10` memmove into the inline buffer, then `[obj+4] = len`, `[obj+0xc+len] = 0`),
+  `0x10037dc0` = aligned alloc/resize helper, `0x10174710` = heap free, `0x11788480` / `0x11790540` =
+  `std::string` bookkeeping that write the class pointer `0x128ac3f4` into the global object
+  `0x12829424` (see the singleton bullet; `0x128ac450` was read from the same kind of site and is likewise
+  a `.bss` object, not a file constant). `0x11a1b940` (60 call sites) = "find `<switch>` in the command line, take the text
+  after it, store it in an SSO string": two `strstr` calls (`[0x11be1618]`) + `strlen` + assign, with `"`
+  (byte `0x22`) quote handling and a space (`0x20`, table at `0x11f31df8`) token split via `0x10003f40`.
+  ⇒ `-exec` / `-execline` values are **collected** into the execLines container (`0x12829424`), not executed
+  in the launcher. The execution step is the engine's execLines consumer (`FC3.dll` session field
+  `execLines` `0x11f90af0`, registered at `0x113429ca`) — the next probe target.
+- **Container-global reference count and construction sites (verified 2026-11-02).** A little-endian scan of
+  `FC3_d3d11.dll .text` for the byte pattern `24 94 82 12` finds **17 332** references to the global
+  `0x12829424`, confirming it is a real singleton used throughout the launcher. Exactly two sites write an
+  immediate class pointer into it: `c7 05 24 94 82 12 f4 c3 8a 12` at `0x1178846e` and again at `0x118e82fd`
+  (value `0x128ac3f4`, i.e. `f4 c3 8a 12` little-endian). All other 17 330 references are reads
+  (`8b/89/8d/83/81 … [0x12829424]`, `ff 35`), i.e. normal member access of one global object.
+- **Complete host/client netblock (VERIFIED 2026-11-02, contiguous `.rdata` run, both 1.06 binaries).**
+  `FC3_d3d11.dll 0x11fdc02c`..`0x11fdc150` and `FC3.dll 0x11fad15c`..`0x11fad308` mirror the same order:
+  `-keyonline` `0x11fdc02c`/`0x11fad15c`, test value `a123456` `0x11fdc038`, `-login` `0x11fdc040`,
+  `-login2` `0x11fdc048`, `-login3` `0x11fdc050`, `-login4` `0x11fdc058`, `-password2` `0x11fdc060`,
+  `-password3` `0x11fdc06c`, `-password4` `0x11fdc078`, `Invalid parameters for -host, missing (-login)`
+  `0x11fdc084`/`0x11fad1b4`, `-sessionuid` `0x11fdc0b4`/`0x11fad1e4`, `-deathmatch` `0x11fdc0c0`,
+  `-coop` `0x11fdc0cc`, `-domination` `0x11fdc0d4`, `-headquarters` `0x11fdc0e0`, `-firestorm` `0x11fdc0f0`,
+  `-dash` `0x11fdc0fc`, `-online` `0x11fdc104`, `-netemulator` `0x11fdc10c`, `-ranked` `0x11fdc11c`,
+  `-ip` `0x11fdc124`, `Missing -login or -ip for -client.` `0x11fdc128`, `Trying to launch an online client, but
+  missing password (-password) or online key settings (-keyonline)` `0x11fdc1d8` (referenced at code VAs
+  `0x11aa085f`, `0x11aa086f`), then the net-engine state names `ENetEngineState_Error` `0x11fdc240`,
+  `ENetEngineState_Initialized_Offline` `0x11fdc258`, `ENetEngineState_Initializing_Offline` `0x11fdc27c`.
+  ⇒ 1.06 accepts `-host <world> -login … -coop … -online [-ip <addr>]` on the command line; the
+  game-mode words (`-coop`, `-deathmatch`, `-domination`, `-headquarters`, `-firestorm`, `-dash`) are switches,
+  not menu names.
+- **`-quickmatch` validation (`FC3.dll`).** Helper `0x11a8b8c0` uses strstr via IAT `[0x11bcb5c0]`
+  (`MSVCR100.dll:strstr`), pushes `-online` `0x11fb8234` and `-login` `0x11fb8170`, and on failure prints
+  `Missing -login or -online for -quickmatch.` `0x11fb82d8` (FC3_d3d11 twin `0x11fdc1a8`) ⇒ `-quickmatch`
+  requires `-login` **and** `-online`.
+- **Console-command vocabulary (`FC3.dll` `Game` table, `0x111cd3f5`..`0x111cf52f`).** Co-op-relevant
+  entries with their name strings: `MissionSetState` `0x11fbd98c`, `Exec` `0x11fbda40`, `SaveGame`
+  `0x11fbda48`, `SetTimeOfDay` `0x11fbda30`, `TeleportToCurrentObjective` `0x11fbda7c`, `TeleportToSpawnPoint`
+  `0x11fbdbbc` (+`Red` `0x11fbdbd4`, `Blue` `0x11fbdbec`, `Spectator` `0x11fbdc08`), `SetHealth` `0x11fbdacc`,
+  `GetLocalPlayerId` `0x11fbdcc4`, `SetPlayerId` `0x11fbd8f8`, `IsServer` `0x11fbd880`, `RunBatch` `0x11fbdcb8`,
+  `GetCurrentPrimaryBuddy` `0x11fbdc54`, `SetCurrentPrimaryBuddy` `0x11fbdc3c`, `SendGlobalChatMessage`
+  `0x11fbd9ec`, `SendTeamChatMessage` `0x11fbda04`, `RefillPlayerAmmo` `0x11fbd9a8`, `AIDebugTool`
+  `0x11fbd99c`, `ChangeFOV` `0x11fbdd00`.
+- **Session-operation fields (`FC3.dll` registration function `0x11342740`, `0x11342758`..`0x11342a73`).**
+  Field-registration helpers `0x11ab6750` / `0x11ab6ac0` / `0x11ab6800`; full name set registered in this
+  one function: `SearchIdAddress` `0x11f90b78`, `SearchSessionId` `0x11f90b88`, `JoinGame` `0x11f90b98`,
+  `JoinService` `0x11f90ba4`, `JoinSessionId` `0x11f90bb0`, `DeleteSessionId` `0x11f90bc0`,
+  `DeleteMessageId` `0x11f90bd0`, `PlaylistId` `0x11f90be0`, `MatchMakingEnabled` `0x11f90bec`,
+  `SessionRefId` `0x11f90c00`, `SessionType` `0x11f90c10`, `NetEngineType` `0x11f90c1c`,
+  `AccountType` `0x11f90c2c`, `SearchRanked` `0x11f90c38`, `SearchRetries` `0x11f90c48`,
+  `SearchSlots` `0x11f90c58`, `SearchNeedSlots` `0x11f90c64`, `SearchGameModes` `0x11f90c74`,
+  `Silent` `0x11f90c84`, `DeleteCurrent` `0x11f90c8c`, `WasInvited` `0x11f90c9c`,
+  `EmulatorProfileId` `0x11f90ca8`, `UseTicketRequestAttachment` `0x11f90cbc`, `FollowHost` `0x11f90cd8`,
+  `DoNATTypeDetection` `0x11f90ce4`, then `execLines` `0x11f90af0` (pushed at `0x113429ca`), `map`
+  `0x11f8d78c` (`0x11342a04`), `mapIdLow` `0x11f90afc`, `mapIdHigh` `0x11f90b08`, `versionIdHigh`
+  `0x11f90b14`, `versionIdLow` `0x11f90b24`, `mapIdType` `0x11f90b34`, `bfname` `0x11f90b40`
+  (`0x11342a73`). String VA → code reference counts: `execLines` has exactly **one** reference in
+  `FC3.dll` (the `push imm8` at `0x113429ca`), and `Exec` `0x11fbda40` exactly one (`push imm8` at
+  `0x111cf4dd`), so this table is the registration site, not a dispatch site.
+  `execLines` being a session-operation field, registered immediately before `map`/`mapId*`/`bfname`, is
+  the strongest link between the command line and a co-op session request: those are exactly the
+  parameters a session-creation call needs.
+- **`exec` / `runbatch` registration and the batch-file operation class (VERIFIED 2026-11-02, 1.06).**
+  `FC3_d3d11.dll` registers console command `exec` `0x11fdd478` with signature `Game:Exec(%%)` `0x11fdd468`
+  (help `Runs a console command "batchfile". Usage: "exec <batchfile>"` `0x11fdd428`, refs `0x111f5c0a` /
+  `0x111f5c1a`) inside a registration block `0x111f5b80`..`0x111f5cbc` whose enclosing function starts at
+  `0x111f4eab`. Registration call at `0x111f5c7b`: `push ebx; push 1; push edx; push <sig>; push eax;`
+  `push ecx; call 0x1163d910` — the handler pointer is carried in `ebx` (a stack value), so
+  `PE.code_refs()` cannot locate it (it only sees `push imm32` / `mov r32, imm32`). `FC3.dll` twins: help
+  `0x11fb9558`, `Usage: runbatch <batchfile>` `0x11fba5bd` (`FC3_d3d11` twin `0x11fde48d`), refs
+  `0x111f032a` / `0x111f033a`. The engine batch-file operation class name `CFCXRunBatchFileOperation`
+  (`FC3_d3d11.dll` `0x12032844`, ref `0x104e5fe9`; `FC3.dll` `0x1200e72c`, ref `0x104df159`) is registered
+  from global-init function `0x104e5f42`, which guards on `cmp byte ptr [0x1288b074], 0` and registers its
+  siblings the same way (`CFCXClearMessageBoxManager` `0x12032808`, `CFCXPrepareUnloadWorldOperation`
+  `0x12032824`; idiom `call 0x103a9180` → `push <name>` → `call 0x10038870`). Both `0x104e5f42` and
+  `0x111f5a00` report **0 E8 callers**: these registration blocks are global-initialization functions run by
+  the CRT initializer (`.initterm`), so `fc3_callers.py` finds nothing — do not treat "0 callers" as "dead
+  code".
+- **Session-creation call layout in the `-quickmatch`/`-host` branch (`FC3.dll`).** `0x11a8d0c5`..`0x11a8d0e2`:
+  `lea edx,[ebp+8]; push edx; lea edi,[ebp-0xb4]; call 0x11341dc0` → `mov ecx,[eax]` (vftable) →
+  `mov eax,[ecx]` → `mov eax,[eax+0x74]` → `lea edx,[ebp+0x10]; push edx; lea esi,[ebx+0x18]; call eax` →
+  `mov edi,eax; call 0x10005570` (release) → `jmp 0x11a8cf90`; failure path destructor
+  `lea ecx,[ebp-0xb4]; call 0x11343640` at `0x11a8d0f6` frees fields at `[obj+0x98]` / `[obj+0x9c]`.
+  ⇒ **vftable slot `0x74` takes exactly one argument: a 0xB4 (180-byte) session-parameter struct at
+  `[ebp+0x10]`**, and the interface handle is tracked in a `[ebp-0xb4]` object. Session-interface getter
+  `0x11341dc0` has **31 E8 callers** in `FC3.dll` (`0x10ce93c9`, `0x10edd676`, `0x10edd6e9`, `0x10edd71a`,
+  `0x11163252`, `0x11163b6f`, `0x111fa8de`, …) ⇒ it is a generic accessor, so the co-op route has to be
+  identified by the 180-byte struct layout, not by caller uniqueness.
+- **Lesson (2026-11-02):** registration routines reached only through the CRT initializer are invisible to a
+  caller scan, and handler/callback pointers passed in registers are invisible to `code_refs()`. The
+  remaining handle on the `-exec` consumer is the 180-byte session-parameter struct at
+  `FC3.dll 0x10a8d0db` plus the session object's `+0x98` field — probe those layouts next.
+- **ExecLines container is a global singleton (`FC3_d3d11.dll`).** A raw byte scan of `.text` for the
+  disp32 `24 94 82 12` (0x12829424 in little-endian) gives **17 502 access sites**, overwhelmingly
+  `8b 0d` (`mov r32,[g]`) pairs ~12 bytes apart — the `mov ecx,[g]` / `call fn` idiom — i.e. this global
+  is the manager object used as `this` by thousands of calls; only two construction-shaped writes
+  (`c7 05` at `0x1178846e` and at `0x118e82fd`). Lesson recorded the hard way: a VA is written in
+  **little-endian** in the image (`0x12829424` → `24 94 82 12`); searching for the reversed byte order
+  (or computing blob offsets with VA arithmetic instead of `file offset − section raw pointer`) produces
+  false "0 matches" results.
+- **Static dead end for the `execLines` consumer (2026-11-02, `FC3_d3d11.dll` 1.06):** the lazy-init
+  thunk at function `0x118e82d0` is the container's Meyers-singleter accessor — `test byte ptr
+  [0x128ac410], 1` / `or dword ptr [0x128ac410], 1` / `push 0; mov ecx, 0x128ac3f4; call 0x106c4b40` /
+  `push 0x11bb98c0; call 0x1070085d` / `mov al, 1; mov dword ptr [0x12829424], 0x128ac3f4; ret` — and
+  `0x11bb98c0` is an atexit-registered destructor thunk (`mov ecx, 0x128ac3f4; jmp 0x106c4b70`), sibling
+  `0x11bb98d0` for the next global. Session-op field names are registered on first use by lazy thunks
+  (`0x11348230` guard `[0x1282a60c]` → `call 0x11347c60` guard `[0x1282a607]` → `push <name>; push <size>`
+  → `call 0x103173f0`, then `[0x12852d54]`/`[0x12852d58]` and `[0x12852dcc]`/`[0x12852dd0]` pairs,
+  `sar ecx, 2` = element count), and the registry is only ever touched by 10-byte accessor thunks at
+  `0x11bc8a80`..`0x11bc8ad0` shaped `b8 <slot> ; e9 <jmp 0x10004d70>`. Conclusion: a static scan will not
+  isolate the consumer — `mov ecx,[0x12829424]; call 0x106c99b0; mov eax,<str>; call 0x11788480` occurs
+  8 311 times in the binary, i.e. the generic container idiom. Next handle is dynamic: a `-exec`/`-execline`
+  run against the test copy, or Ghidra decompilation of the thunks (`scripts/fc3_ghidra_dis.py`).
+- **1.06 co-op switches and the co-op quick-launch parser (`FC3_d3d11.dll`, 22:xx session).** The
+  string `-coop` lives at `0x11fdc0cc` (in the same contiguous switch block as `-perfhud` `0x11fdbc1c`,
+  `-logFile` `0x11fdbc28`, `-bfname` `0x11fdbc34`, `-execline` `0x11fdbc3c`, `-exec` `0x11fdbc48`,
+  `-quickstartup` `0x11fdbc50`, `-debugFramerateCameras` `0x11fdbcf8`). It is parsed in TWO functions:
+  the main launch-argument parser entry `0x11aa0670` (`push ebx/[ebp+8]` prologue; `-coop` refs
+  `0x11aa08d3` and `0x11aa0cfc`, `-bfname` refs `0x11aa089e`, `0x11aa0cb9`) and a second parser region
+  `0x11aa1b90` (also handles `-netemulator` `0x11fdc10c` at `0x11aa10cc`/`0x11aa10db`, `-ranked`
+  `0x11fdc11c` at `0x11aa0bda`/`0x11aa1198`, `-spawn` `0x11fdbe90`, `-spawnpos` `0x11fdbe98`,
+  `-spawnangle` `0x11fdbea4`, `-class` `0x11fdbe88`); the exec/console parser is `0x11aa2fe0`
+  (`-bfname` at `0x11aa302a`, `-execline` at `0x11aa3054`/`0x11aa3070`/`0x11aa30ce`, `-exec` at
+  `0x11aa3144`/`0x11aa3167`/`0x11aa3244`/`0x11aa3250`, `-quickstartup` at `0x11aa326a`, then the
+  console lines `gfx_NoLaunchCountdown 1` `0x11fdbc60`, `gfx_NoPostRoundCountdown 1` `0x11fdbc78`,
+  `gfx_NoPreRoundTimeOut 1` `0x11fdbc94`, `multi_DisableInitialSpawnDelay 1` `0x11fdbcac`,
+  `hack_loadOutIsWaitingForMissionBlocks 0` `0x11fdbcd0`). Three E8 call sites into `0x11aa2fe0`:
+  `0x117b565d`, `0x117b7003`, `0x11997f41`, plus one table slot `0x11f31b10`. `-splitscreen`
+  `0x11f31d75`, `-splitscreen4` `0x11f31d85` and `-numclients` `0x11fb1e18` have no immediate-operand
+  code reference in 1.06: `-splitscreen` and `-splitscreen4` have zero immediate references, while
+  `-numclients` does have one (`0x1135381e`, inside the session-operation registry chain that also
+  touches `mode`/`spawnPtId`/`keepPlayerState`). So `-numclients` is wired into the session-creation
+  path in 1.06, not just a dead string.
+- **1.06 `-password` handler and the BF password buffer:** function `0x117b5580`
+  (`push ebp; mov ebp,esp; sub esp,8; mov eax,[ebp+8]`) builds a string from `[eax]` or `[eax+0xc]`
+  (`0x117b5597 mov eax,0x11f31ea8` when empty), `0x117b55a6 mov eax,0x11f31d34 str='-password'`,
+  `0x117b55ab call 0x117b5160` (the switch parser), then if a value exists and `[ebx+4] != 0`:
+  `0x117b55c4 test byte ptr [0x128b59a8],1`, `0x117b55cc or dword ptr [0x128b59a8],1`,
+  `0x117b55d2 push 0x11f31bbc str='******'` with `mov dword ptr [0x128b59a4],0`,
+  `0x117b55dd call 0x10002a50`, `0x117b55f1 call 0x10001ec0`, `0x117b55f6 push 0x11bb76a0`,
+  `0x117b55fb call 0x1070085d` (callback registration), `0x117b5606 push 0x128b59a4`. Same function
+  hosts the call sites `0x117b5653 call 0x11aa0670` and `0x117b565d call 0x11aa2fe0`. Meaning: bundle
+  (`-bfname`) password handling is resolved before the launch arguments, so a password-protected
+  co-op bundle is reachable from the command line.
+- **Corrected 1.06 session-descriptor field block:** the field-name strings of the session-operation
+  registry are contiguous at `0x11fb4a00`..`0x11fb4c98` (the block quoted in the older note as
+  `SearchSessionId 0x11f90c…`, `FollowHost 0x11f90cd8`, `DoNATTypeDetection 0x11f90ce4` and
+  `execLines 0x11f90af0` was the WRONG build: those addresses are `.rdata` pointer-table dwords, not
+  strings). 1.06 values: `untFlags` `0x11fb4a00`, `controllerIndex` `0x11fb4a0c`, `silentLogin`
+  `0x11fb4a1c`, `isPrimaryIndex` `0x11fb4a28`, `platformSpecificId` `0x11fb4a38`, `demoname`
+  `0x11fb4a4c`, `isInEditor` `0x11fb4a58`, `fullNetworkInitialization` `0x11fb4a64` (ref
+  `0x113478e0`), `execLines` `0x11fb4a80` (single reference, push site `0x1134824a`), `mapIdLow`
+  `0x11fb4a8c`, `mapIdHigh` `0x11fb4a98`, `versionIdHigh` `0x11fb4aa4`, `versionIdLow` `0x11fb4ab4`,
+  `mapIdType` `0x11fb4ac4`, `bfname` `0x11fb4ad0` (refs `0x11328860`, `0x113482f4`), `execFilenames`
+  `0x11fb4ad8` (ref `0x11348300`), `saveGameFilename` `0x11fb4ae8`, `unloadWorld` `0x11fb4afc`,
+  `SearchIdAddress` `0x11fb4b08`, `SearchSessionId` `0x11fb4b18`, `JoinGame` `0x11fb4b28` (ref
+  `0x11348010`), `JoinService` `0x11fb4b34`, `JoinSessionId` `0x11fb4b40`, `DeleteSessionId`
+  `0x11fb4b50`, `DeleteMessageId` `0x11fb4b60`, `PlaylistId` `0x11fb4b70`, `MatchMakingEnabled`
+  `0x11fb4b7c`, `SessionRefId` `0x11fb4b90`, `SessionType` `0x11fb4ba0`, `NetEngineType` `0x11fb4bac`,
+  `AccountType` `0x11fb4bbc`, `SearchRanked` `0x11fb4bc8`, `SearchRetries` `0x11fb4bd8`, `SearchSlots`
+  `0x11fb4be8`, `SearchNeedSlots` `0x11fb4bf4`, `SearchGameModes` `0x11fb4c04`, `Silent` `0x11fb4c14`,
+  `DeleteCurrent` `0x11fb4c1c`, `WasInvited` `0x11fb4c2c`, `EmulatorProfileId` `0x11fb4c38`,
+  `UseTicketRequestAttachment` `0x11fb4c4c`, `FollowHost` `0x11fb4c68`, `DoNATTypeDetection`
+  `0x11fb4c74`. Registration chain: `0x11347fc0` (guard `cmp byte ptr [0x1282a60d],0` → `jne 0x11348217`
+  → `call 0x11347bc0`) registers the matchmaking fields, `0x11348230` (guard `[0x1282a60c]`) registers
+  `execLines` (`push 0x11fb4a80; push 8; mov byte ptr [0x1282a60c],1; call 0x103173f0` then
+  `mov ecx,[0x12852dd0]`, `mov eax,[0x12852dcc]`, `lea eax,[eax+ecx*4]`, `push 1`,
+  `mov esi,0x12852dcc`, `call 0x10638fb0`), `0x11347c60` (guard `[0x1282a607]`) registers the
+  quickload/respawn fields `touched` `0x11fb4c90`, `world` `0x11f46910`, `pos` `0x11f39450`,
+  `spawnPtId` `0x11fb4c98`, `keepPlayerState` `0x11fb4ca4`, `mode` `0x11fb4c88`, plus `OperationId`
+  `0x11fb4938`, `EngineUpdateFlag` `0x11fb4944`, `ranked` `0x11f45e34`. Getter `0x103173f0`
+  (`cmp byte ptr [0x128293f4],0`, allocations of `0x10+0x20` = 48 bytes through `0x11790750` /
+  `0x118e8340`); container walker `0x10638fb0` (`mov ecx,[esi+4]`, `lea ebx,[ecx+edi]`,
+  `lea ecx,[edi+ecx*4]`, `cmp eax,ecx`). `execLines` type code is the `push 8` next to its name
+  (8 = string/vector-like type id), while the 180-byte claim in the older note belonged to the wrong
+  build — re-measure on 1.06 if the descriptor size matters.
+- **Option-string consumption cluster in 1.06 (22:4x session, `FC3_d3d11.dll`).** Option strings are loaded
+  with `mov reg, imm32` and passed through a common resolver, never with `push imm32`, which is why the
+  old `push`-based scans found nothing. `-bfname` `0x11fdbc34` is consumed at `0x1105b68b`
+  (`mov eax,0x11fdbc34`; `call 0x11790540`; `call 0x10001e40`) inside a function gated by
+  `0x1105b670 cmp dword ptr [esi+0x110],0` + `mov eax,[0x1282908c]`, with the result flag written to
+  `0x1105b6b3 mov byte ptr [0x1282a668],1` (`[ebp+8]` is the caller-supplied bundle name); a second
+  site loads `0x11fdbc3c` (`-execline`) at `0x1105b6b0` in the same function. `-spawnangle`
+  `0x11fdbea4` is consumed at `0x111e1e54`/`0x111e1e67` (`mov ecx,0x11fdbea4`; `mov esi,0x11fdbea4`,
+  `call 0x11057c60`, then `mov byte ptr [0x1282a6c8],al`). The application half of that claim is **refuted**:
+  a full `.text` scan of `FC3_d3d11.dll` for `lea ecx,[edi+0x430]` finds none, and only four mov-family
+  instructions touch offsets `+0x430`/`+0x434` anywhere (`0x10544b8d` — a struct/float copy block reading
+  `[edi+0x4e8]`..`[edi+0x510]`; `0x10e6356d`/`0x10e63597` — distance math using `call 0x10007f80` (sqrt);
+  `0x1160ab44`), none of them spawn-related. `spawn_angle` does **not** exist as a string in 1.06 (0 occurrences) and the
+  `0x11fa7000` address from the older note is a `.rdata` pointer table, not a name: there is no
+  per-slot spawn angle in the session descriptor (see the spawn data-flow bullet below). Re-measurement note: the
+  1.05-era `push <name>; push 0x1c; call 0x10a46480` shape is `FC3.dll` 1.05 code (`0x10a8d0db`), and its
+  1.06 counterpart `push 0x11fb4a80; push 8; call 0x103173f0` uses type code 8 — the earlier "180-byte
+  struct" reading came from a `.rdata` pointer-table entry being mistaken for a string, so treat that
+  size claim as unverified.
+- **1.06 spawn-address audit and the GameContext spawn fields (verified by direct byte reads).**
+  `-spawn` is read at three places (`0x11aa0eb8`, `0x11aa15f3`, `0x11aa2777`), `-spawnpos` at
+  `0x11aa0f09`, `0x11aa1645`, `0x11aa27c1`, `-spawnangle` at `0x11aa0fbd`, `0x11aa16fb`, `0x11aa286b`
+  (main parser `0x11aa0670`, second parser `0x11aa1b90`, exec/console parser `0x11aa2fe0`). The
+  GameContext node-registry block holds the contiguous names `spawnAt` `0x11f4692c`, `spawnPos`
+  `0x11f46934`, `spawnAngle` `0x11f46940`, `usePosAngle` `0x11f4694c` and all four are read in one
+  function at `0x1170fdba`, `0x1170fdcf`, `0x1170fde7`, `0x1170fe03`; the session-operation registry
+  names `spawnPtId` `0x11fb4c98` (`0x11347f0b`), `keepPlayerState` `0x11fb4ca4` (`0x11347f20`),
+  `touched` `0x11fb4c90` (`0x11347e68`) and `mode` `0x11fb4c88` (`0x11347f6c`, `0x11347f9c`) are each
+  read once. Pre-spawned defaults exist as complete strings with values already substituted:
+  `' -spawnpos=333.63,964.5,124.465'` `0x11fdbdc4`, `' -spawnangle=0.0,0.0,0.0'` `0x11fdbde4`,
+  `' -spawnpos=-857.626,2317.1,119.752'` `0x11fdbe0c`, `' -spawnangle=0.0,0.0,-20.0'` `0x11fdbe30`,
+  `Gamescom` `0x11fdbe00` + `' -world=fc3_main'` `0x11fdbdb0`, referenced from `0x11aa2fe0`
+  (`0x11aa394c`, `0x11aa395f`, `0x11aa3aeb`, `0x11aa3afe`). Names the older note claimed are **not**
+  in 1.06 `.rdata` (0 occurrences): `sessionName`, `sessionDescription`, `sessionFilter1`,
+  `sessionFilter2`, `clientName`, `serverName`, `sessionExecFile`, `execFilenames2`, `bundleName`,
+  `bundleDir`, `bundlePath`, `sessionPath`, `sessionParams`, `spawn_angle` (the claim that the last
+  one lived at `0x11fdb658`..`0x11fdb680` is wrong; that region holds `-bfname`/`-execline`/`-exec`/
+  `-quickstartup` and their call sites). `sessionMode` `0x11f31ba8`, `netGame` `0x11f31b7c`,
+  `networkGame` `0x11f468e0`, `usePosAngle` `0x11f4694c` and `dedicatedConfig` `0x11f46900` are
+  present. Scripts: `local/scratch/audit_names.py`, `local/scratch/refs2.py`
+  (output `local/scratch/out/refs2.txt`).
+- **Spawn data flow solved (verified, researcher-confirmed by disassembly).** The four GameContext
+  spawn sites are a lazy descriptor-registration thunk `0x1170fd70` (guard `cmp byte [0x128299c8],0`):
+  `push <offset>; push <name VA>; mov eax,0x1282db10; call 0x11acaba0|0x11acac50|0x11acae60`. Node
+  `0x1282db10` field map: `world` +0x08, `mergedBigFileName` +0x10, `spawnAt` +0x0C (string),
+  `spawnPos` +0x14 (float triple), `spawnAngle` +0x20 (float triple), `usePosAngle` +0x2C (byte),
+  `loadingdepActive` +0x2D. A sibling thunk `0x1170fe40` registers `networkGame`/`host` on a different
+  struct (`0x1282daf8`). Writing happens only in the three parsers: chain is always
+  `strstr [0x11be1618]` → value extractor `call 0x11a1b940` → `sscanf [0x11be1398]` with `'%g,%g,%g'`
+  (`0x11f39f50`) → node accessor (`mov eax,[esi+0x9c]`; `mov edi,[eax+4]`; `mov eax,[edx+0x18]`;
+  `call eax`) → stores. `-spawn` → `call 0x11347550` (`0x11aa0eeb`, twin `0x11aa27a3`) stores a
+  refcounted string at node+0x0C; `-spawnpos` writes `movss [eax+0x14]/+0x18/+0x1c` and sets
+  `mov byte [eax+0x2c],1` with **no degree conversion** (`0x11aa0f8a`..`0x11aa0f9e`, also
+  `0x11aa16c8`.., `0x11aa2839`..); `-spawnangle` loads `0x11f32198` = 0.0174532924 (1 degree in
+  radians), `mulss` all three components and stores `movss [eax+0x20]/+0x24/+0x28` — i.e. the game
+  stores **radians** (`0x11aa1014`..`0x11aa1084`, also `0x11aa1723`.., `0x11aa288d`..). The exec
+  parser also builds complete literal command lines: `' -world=fc3_main'` `0x11fdbdb0` +
+  `' -spawnpos=-857.626,2317.1,119.752'` + `' -spawnangle=0.0,0.0,-20.0'` (variant A
+  `0x11aa3909`..`0x11aa3967`, then `call 0x11aa2630` @`0x11aa3989`, preceded by `'Gamescom'`
+  `0x11fdbe00`) and variant B `0x11aa3aaa`..`0x11aa3b06` with `333.63,964.5,124.465` /
+  `0.0,0.0,0.0`; neighbours `-benchmark` (`0x11fdbe4c` → `call 0x11aa14b0` @`0x11aa39ed`), `-host`
+  `0x11f31c7c`, `-client` `0x11f31d18`, `'multi_SkipIntroMovie 3'` `0x11fdbd30`,
+  `'starMatch_with_debugCameras 1'` `0x11fdbd10`. **There is no per-player spawn**: `spawnPtId`
+  `0x11fb4c98` and `keepPlayerState` `0x11fb4ca4` appear only inside `0x11347e40`, a one-shot
+  registration (guard `cmp byte [0x1282a610],0` → `jne 0x11347f2c`) that allocates exactly one
+  `0x10+0x20` record (`call 0x11790750`), appends it with a single `push 1` to the 4-byte-per-entry
+  array `[0x12852e2c]`/`[0x12852e30]` (different container from the `execLines` array
+  `[0x12852dcc]`/`[0x12852dd0]`), and registers fields off `lea esi,[edi+0x14]`: `world` +4, `pos`
+  `0x11f39450` +8, `spawnPtId` +0x18 (`call 0x11acaf10` @`0x11347f11`), `keepPlayerState` +0x20
+  (`call 0x11acac50` @`0x11347f24`). No loop, no index, no player-slot iteration → one global spawn.
+  RESOLVED (2026-11-02, local re-derivation with `capstone` over the `1.06` `.text`): the QuickLaunch
+  sites are **not** spawn consumers, and the `[edi+0x430]`/`[edi+0x434]` writer does not exist. Prologue
+  backtracking shows the claimed sites sit inside other functions: `0x111e2970` and `0x111e2984` belong to
+  the function at `0x111e27b0`, `0x111e4140` to `0x111e3f30`, while `0x11057c60` and `0x10404f40` have no
+  prologue within 0x900 bytes. `0x111e1e54` sits in a thin wrapper (`push ebp; mov ebp,esp; … mov
+  eax,[0x1282a7b4]; call 0x111e9bd0; ret 4`) and its callee `0x111e9bd0` is a pure dispatcher (`call
+  0x111e7300`, `0x102745d0`, `0x11706240`, `0x11310be0`, `0x1013b1c0`, `0x106bd910`) that never touches the
+  spawn offsets; `[0x1282a7b4]` is a session-config singleton (91 immediate references) and holds no data
+  pointer to the spawn node (`0x1282a7b4` appears 0 times outside `.text`). Node `0x1282db10` is
+  referenced 13 times, all in the registration/consumption chain (`0x1125ed11`, `0x1170f491`, `0x1170fc5b`,
+  `0x1170fc6d`, `0x1170fd8e`..`0x1170fe36`, `0x11bbb1f1`). Evidence: `local/scratch/ql_local.py`,
+  `ql2.py`, `ql3.py` with output in `local/scratch/out/ql_local.txt`, `out/ql2.txt`, `out/ql3.txt`.
+- **PE layout facts for `FC3_d3d11.dll` 1.06 (ImageBase `0x10000000`, EP RVA `0x700be8` = VA
+  `0x10700be8`):** `.text` `0x10001000`–`0x11be01c1` (raw `0x400`–`0x1bdf600`), `.rdata`
+  `0x11be1000`–`0x120b7347`, `.data` `0x120b8000`–`0x128bc788` with raw size only `0xe7c00`, `.rsrc`
+  `0x128bd000`, `.reloc` `0x12bfa000`. Because virtual size (`0x804788`) is larger than raw size
+  (`0xe7c00`), everything in `.data` from about `0x1219fc00` to `0x128bc788` is **uninitialized (.bss)**:
+  its bytes are absent from the file, so no analysis of a global in that range can be done from the file
+  alone — only from the instructions that reference it. `scripts/fc3_addrmap.py:va2off` returns `None` for
+  such addresses, which is the correct behaviour and is what exposed this.
+- Tooling note: `capstone` (5.0.9, installed with `python -m pip install capstone`; the `pip` launcher is
+  broken on this machine) plus `scripts/fc3_dis.py` (annotated x86 disassembly), `scripts/fc3_iat_reverse.py`
+  (IAT reverse map), `scripts/fc3_strgrep.py` (.rdata string grep) replace Ghidra for read-only work; those
+  scripts stay local per `.gitignore`. Note: `fc3_addrmap.py:code_refs` returns raw file offsets, not VAs
+  (for `FC3.dll`: VA = offset + `0x10000c00`).
+- Menu automation note: the menu ignores synthetic `mouse_event` clicks; keyboard scodes sent with
+  `SendInput` (`local/menu.py press down|enter`) do reach the menu.
+- Local-VM caveat: `local/menu.py` and `local/registry-fc3-backup.reg` are artifacts on the owner's
+  machine and are not committed in this repo — recreate them from the registry values above if needed.
+
+## Launch bridge measured (2026-11-02, `scripts/fc3_launch_probe.py` + `scripts/fc3_upc_probe.py`)
+
+The stub does **not** run the game directly, and it does **not** silently discard the extra arguments — it
+hands them to Ubisoft Connect. Observed process tree from `TestFC3/bin/farcry3_d3d11.exe -language=Russian
+-quickstartup -host fc3_main -login coop1 -coop`:
+
+1. stub pid 25472 exits with code 0 after ~6 s.
+2. new process `C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\upc.exe`, pid 18080, command line with
+   **every argument preserved**: `-upc_uplay_id 46 -language=Russian -quickstartup -host fc3_main -login
+   coop1 -coop -upc_desktop_mode -upc_game_starter`.
+3. upc then starts the **canonical install** stub and drops the quick-launch arguments:
+   `"H:/Uplay/Far Cry 3/bin/farcry3_d3d11.exe" -language=Russian` (pid 31948, ppid 2068).
+
+⇒ the forwarding path is `upc.exe -upc_uplay_id <id> <switches> -upc_desktop_mode -upc_game_starter`; the
+drop happens only in upc's final game start. A trampoline in front of `TestFC3/bin/farcry3_d3d11.exe` that
+calls `upc.exe -upc_uplay_id <id> <args> …` is the candidate for option (b) — it needs the test copy's **own**
+uplay id (id 46 resolves to the store install) and the canonical game must not already be running (pid 31948
+made a later `upc` relaunch exit 0 within 6 s — the `OpenMutexA("FarCry3Instance")` single-instance guard).
+
+Also verified on 1.06: `FC3_d3d11.dll` imports **only `ShellExecuteA`** (`SHELL32.dll`, thunk `0x11be1720`, 2
+call sites `0x10c13882` and `0x10fc2382`, both shaped `6A 01 6A 00 6A 00 68 <url> 68 <verb> 6A 00
+FF 15 20 17 BE 11 C3`; verbs `open`/`reopen`/`read` at `0x11f5f210`), and both URLs are marketing links —
+`http://shop.ubi.com/store/ubiemea/html/pbPage.generic-Far-Cry-3-303-other…` at `0x1209f220`,
+`http://store.steampowered.com/app/220240` at `0x1202fcec`. `FC3_d3d11.dll` imports **no `ShellExecuteEx`
+and no `CreateProcess`**, so the earlier working note claiming "ShellExecuteEx at `0x11a4b404`" was a mis-read
+of a direct call inside a 1181-byte function (`0x11a4b…`..`0x11a4b4c5`, 30 direct calls, 0 indirect calls).
+The re-exec is performed by the launcher/UI layer through Ubisoft Connect, not by a `CreateProcess` in the
+game DLL.
+
+**Conclusion:** quick-launch co-op is impossible on this build without either (a) a 1.05 DRM-free executable,
+or (b) a launcher bridge — a stub/UPC trampoline that makes Ubisoft Connect start **our own** copy with the
+quick-launch arguments (the argument forwarding itself is now measured, above). Both need a decision from the
+owner.
+
+### Script and artifact locations / Размещение скриптов и артефактов
+
+Analysis scripts in this fork stay out of git by the owner's ignore rules
+Analysis scripts live in `scripts/` and are tracked (Bantila's own convention: `scripts/` is
+tracked, `/tools/` is ignored for external binaries like Ghidra or the packer). My session scripts
+are committed here: `fc3_dis.py`, `fc3_callers.py`, `fc3_addrmap.py`, `fc3_iat_reverse.py`,
+`fc3_strgrep.py`, `fc3_reloc_xref.py`, `fc3_trampoline.py`, `fc3_upc_probe.py`,
+`fc3_launch_probe.py`, `fc3_execlines_probe.py`. Disassembler caches (`fc3_dis_cache.json`), the
+agent harness scratch (`Temp/`) and private state (`local/`, `local/scratch/`) are gitignored.
+Scratch patterns in `.gitignore`: `*.scratch*`, `.scratch*`, `scratch_*`, `local/scratch/`.
+
+Canonical layout: the owner's scheme is everything under `E:\FarCryCoop\` — `Downloads\<name>\`,
+`Tools\`, `Data\`, `Temp\`, `Work\` (see `docs/workspace.md`). Drive `E:` is absent on
+this machine, so it is historical evidence, not the live layout here. Live paths on this PC
+(verified 2026-11-02, canonical: `AGENTS.md` + hub `docs/LOCAL.md`): repos at
+`D:\Projects\Co-op Anything\`, the 1.06 test game copy at `H:\FarCryCoop\TestFC3\`, the
+read-only Ubisoft Connect install at `H:\Uplay\Far Cry 3\`. Carried-over bantila scripts
+originally hardcoded `DLL_106 = E:\SteamLibrary\steamapps\common\Far Cry 3\bin\FC3.dll` and
+`DLL_105 = E:\FarCryCoop\Downloads\fc3-1.05\bin\FC3.dll`; the local `scripts\` copies are retargeted to the
+verified paths above. The agent harness writes its own temp work to `C:\Users\<user>\AppData\Roaming\pi-desktop\tmp` (delegate
+outputs, sandbox scripts), which contradicts golden rule 2 (never touch C:) — flagged, not
+fixed: a contradiction inside the owner's own rules is the owner's decision, not the agent's.
+
+An undeletable stray file named `nul` sits at the workspace root and makes `git add -A` fail
+(`error: invalid path 'NUL'`); commit with explicit paths only.
+
+## Session-descriptor record tables (2026-11-03, both 1.06 modules)
+
+**How they were enumerated.** `python -I scripts/fc3_param_records.py <pe> <creator VA> … --window 64`
+scans `.text` for `e8 rel32` to a descriptor creator, then walks back `--window` bytes for
+`push imm32` (the name string VA) and `push imm8` (the type code). Registration shape in both modules:
+`push 3; push 0; push <descriptor VA>; push 0; push 0x21; mov eax, <name VA>; call <registrar>`. The
+look-back can cross function boundaries, so use `--ident-only` (`IDENT_RE = ^-?[A-Za-z][A-Za-z0-9_.]{1,39}$`)
+and keep only call sites inside the registration block: `FC3_d3d11.dll 0x11347xxx` / `0x11348xxx`,
+`FC3.dll 0x11341xxx` / `0x11342xxx`. Full dumps: `local/scratch/param_recs_session_block_d3d11.txt`
+(63 lines) and `local/scratch/param_recs_fc3dll_families.txt` (4118 lines).
+
+**Registrar families (corrected).** `FC3_d3d11.dll` 1.06: `0x11acaba0` / `0x11acac50` / `0x11acad00` /
+`0x11acb320` / `0x11acaf10` — these are **generic engine attribute registrars**, they also register
+`Name` `0x11f32188`, `Value` `0x11f333d4`, `Data` `0x11f32280`, `zoneId` `0x11f59698`, so filter by call
+site. `FC3.dll` 1.06 (callee histogram of `0x11341000..0x11343000`): `0x11ab6800` ×25, `0x11ab6750` ×9,
+`0x11ab6ed0` ×11, `0x11ab6ac0` ×8, `0x11ab68b0` ×6, `0x11ab6b70` ×2, `0x11ab6e20` ×1, `0x11ab6a10` ×1,
+plus `0x1003b4b0` ×25, `0x106f9ff0` ×21, `0x100945e0` ×9, `0x10a00be0` ×5, `0x10001ed0` ×5, `0x1030f2b0` ×2.
+The list recorded earlier (`0x11ab64c0` … `0x11ab70b0`) is **wrong** — enumerating with it gives
+`records with a name: 0   all creator call sites: 0`. `0x1030f2b0` (FC3.dll) / `0x103173f0`
+(FC3_d3d11.dll) are not registrars: they are `hkVirtual::operator new(0x1c)` (vtable `0x10bcd68`:
++0 `0x112f0e10` MemoryRealloc, +4 `0x112f0fa0` operator new, +8 `0x112f1530` MemoryDealloc).
+
+**The parameter list is a pointer array indexed by a count, not 48-byte records** (this supersedes the
+old "48-byte records from `0x10+0x20`" note). `FC3.dll` 0x113429d1..0x11342a00
+(`local/scratch/exec_records_dll.txt`): `mov byte ptr [0x12805494], 1` → `call 0x1030f2b0` (0x113429d8) →
+`mov ecx, [0x1282f900]` (count) → `mov eax, [0x1282f8fc]` (array base) → `lea eax, [eax + ecx*4]` →
+`push 1` → `mov esi, 0x1282f8fc` → `call 0x1003b4b0` (0x113429f7, the **exec-record creator**) →
+`push 3; push 0; mov dword ptr [eax], edi` (the hkVirtual descriptor is stored at offset 0 of the
+returned object). `FC3_d3d11.dll` mirror 0x11348251..0x1134828b (`local/scratch/exec_records_d3d11.txt`):
+`mov byte ptr [0x1282a60c], 1` → `call 0x103173f0` (0x11348258) → `mov ecx, [0x12852dd0]` →
+`mov eax, [0x12852dcc]` → `lea eax, [eax + ecx*4]` → `push 1` → `mov esi, 0x12852dcc` →
+`call 0x10638fb0` (**exec-record creator, new anchor**) → `push 3; push 0; mov dword ptr [eax], edi` →
+`push 0x48; push 0x11fb178c ('map'); mov eax, esi; call 0x11acaba0`.
+
+**Exec-related records exist in both modules** — `execLines` (FC3.dll push site `0x113429ca`,
+`call 0x1003b4b0` at `0x113429f7`, type `0x01`; FC3_d3d11 push site `0x1134824a`, `call 0x103173f0` at
+`0x11348258`, type `0x08`) and `execFilenames` (FC3.dll push site `0x11342a7f`, `call 0x1003b4b0` at
+`0x11342aa0`, type `0x01`; FC3_d3d11 push site `0x113482ff`, `call 0x11348306`, type `0x14`). Both
+creators are called with `push 1`, i.e. a one-element collection — this is why the exec records do not
+use the ordinary string/number registrars.
+
+**Session-descriptor names with their string VAs (FC3_d3d11.dll → FC3.dll mirror):**
+`abortEngineUpdateFlag 0x11fb4990` → `EngineUpdateFlag 0x11f909b4` (registrar `0x11ab6b70`, type `0x08`);
+`login 0x11fb49c0` → `0x11f90a30`; `password 0x11fb49d4`; `onlineKey 0x11fb49e0`; `primaryAccount 0x11fb49ec`;
+`accountFlags 0x11fb49fc`; `controllerIndex 0x11fb4a0c`; `platformSpecificId 0x11fb4a38`;
+`demoname 0x11fb4a4c` → `0x11f90abc`; `execLines 0x11fb4a80` → `0x11f90af0`; `mapIdLow 0x11fb4a8c` →
+`0x11f90afc`; `mapIdHigh 0x11fb4a98` → `0x11f90b08`; `versionIdHigh 0x11fb4aa4` → `0x11f90b14`;
+`versionIdLow 0x11fb4ab4` → `0x11f90b24`; `mapIdType 0x11fb4ac4` → `0x11f90b34`; `bfname 0x11fb4ad0` →
+`0x11f90b40`; `execFilenames 0x11fb4ad8` → `0x11f90b48`; `saveGameFilename 0x11fb4ae8` → `0x11f90b58`;
+`SearchIdAddress 0x11fb4b08` → `0x11f90b78`; `SearchSessionId 0x11fb4b18` → `0x11f90b88`;
+`JoinSessionId 0x11fb4b40` → `0x11f90bb0`; `DeleteSessionId 0x11fb4b50` → `0x11f90bc0`;
+`PlaylistId 0x11fb4b70` → `0x11f90be0`; `SessionRefId 0x11fb4b90` → `0x11f90c00`; `SessionType 0x11fb4ba0` →
+`0x11f90c10`; `NetEngineType 0x11fb4bac` → `0x11f90c1c`; `AccountType 0x11fb4bbc` → `0x11f90c2c`;
+`SearchRetries 0x11fb4bd8` → `0x11f90c48`; `SearchSlots 0x11fb4be8` → `0x11f90c58`;
+`SearchNeedSlots / SearchGameModes / Silent / DeleteCurrent / WasInvited / EmulatorProfileId /
+UseTicketRequestAttachment / FollowHost / DoNATTypeDetection / mode` in `0x11fb4bf8..0x11fb4c88`;
+`map 0x11fb178c` → `0x11f8d78c`; `world 0x11f46910` → `0x11f234e0`; `spawnPtId 0x11fb4c98` → `0x11f90d08`;
+FC3.dll-only `pos 0x11f15f68` (site `0x1134267f`, registrar `0x11ab6a10`, type `0x08`).
+Type codes seen with the ordinary registrars: `0x11ab6750` (`map` `0x48`, `bfname` `0x4c`, `login` `0x04`,
+`demoname` `0x0c`), `0x11ab6ac0` (`mapIdLow` `0x28`, `mapIdHigh` `0x20`, `versionIdHigh` `0x38`,
+`versionIdLow` `0x40`, `spawnPtId` `0x18`, `SearchSessionId` `0x10`), `0x11ab6ed0` (`PlaylistId` `0x34`,
+`SessionRefId` `0x20`, `SessionType` `0x38`, `NetEngineType` `0x3c`, `AccountType` `0x40`,
+`SearchRetries` `0x44`, `SearchSlots` `0x48`, `mapIdType` `0x30`), `0x11ab6800` (`0x10`/`0x20`/`0x4c`/`0x4e`/`0x4f`/`0x53`/`0x54`).
+
+**Pseudocode pairs confirmed in both 1.06 modules** (`local/scratch/rea/pseudo-fc3dll-v2/functions/`,
+`local/scratch/rea/pseudo-d3d11-v2/functions/`). Address map FC3.dll ↔ FC3_d3d11.dll:
+`0x11342200`↔`0x11347bc0`/`0x11347c60`/`0x11347da0` (array copy builder, FC3_d3d11 exports two identical twins),
+`0x113423e0`↔`0x11347c60`, `0x11342480`↔`0x11347d00`, `0x113425c0`↔`0x11348480`, `0x11342740`↔`0x11347fc0`,
+`0x113429b0`↔`0x11348230`, `0x11342af0`↔`0x11348370`, `0x1030f2b0`↔`0x103173f0`, `0x1030f250`↔`0x10317390`,
+`0x1030f310`↔`0x10317450`, `0x1030f130`↔`0x10317270`, `0x1030f200`↔`0x10317340`, `0x1030f430`↔`0x10317570`,
+`0x1003b4b0`↔`0x10638fb0`, `0x11ab6750`↔`0x11acaba0`, `0x11ab6a10`↔`0x11acafc0`,
+`0x11ab6ac0`↔`0x11acaf10`, `0x11ab6800`↔`0x11acac50`, `0x11ab68b0`↔`0x11acad00`, `0x11ab6e20`↔`0x11acb270`,
+`0x11ab6ed0`↔`0x11acb320`.
+
+- `0x1003b4b0` / `0x10638fb0` are vector **append** helpers that take the element count: pseudocode is
+  `puVar2 = FUN_10638fb0(1); *puVar2 = uVar1;` and, in the copy builder, `sVar1 = DAT_12845d90 * 4;
+  pvVar3 = FUN_10638fb0((int)sVar1 >> 2); memcpy(pvVar3, pvVar2, sVar1);`. So the record element type is a
+  **4-byte pointer** and each registration appends one pointer.
+- Copy builder (`FC3.dll 0x11342200`): `pvVar2 = DAT_12820c1c; if (DAT_1280548f == '\0') { sVar1 = DAT_12820c20 * 4;
+  pvVar3 = FUN_1003b4b0((int)sVar1 >> 2); memcpy(pvVar3, pvVar2, sVar1); DAT_1280548f = 1; } pvVar2 = DAT_1282f884;
+  sVar1 = DAT_1282f888 * 4; pvVar3 = FUN_1003b4b0((int)sVar1 >> 2); memcpy(...)`. FC3_d3d11 twin: same shape with
+  `DAT_12845d8c`/`DAT_12845d90` under guard `DAT_1282a607`, then `DAT_12852d54`/`DAT_12852d58`. ⇒ the named static
+  arrays are one-time *templates*; the vectors are the live record lists that the builders then register into.
+- Exec-record builder (`FC3_d3d11.dll 0x11348230`, guard `DAT_1282a60c`; FC3.dll twin `0x113429b0`, guard
+  `DAT_12805494`, calls `0x113423e0` first): `uVar1 = FUN_103173f0(8,"execLines"); puVar2 = FUN_10638fb0(1);
+  *puVar2 = uVar1; FUN_11acaba0(&DAT_11fb178c /* "map" */,0x48,0,3); FUN_11acaf10("mapIdLow",0x28,0,3);
+  FUN_11acaf10("mapIdHigh",0x20,0,3); FUN_11acaf10("versionIdHigh",0x38,0,3); FUN_11acaf10("versionIdLow",0x40,0,3);
+  FUN_11acb320("mapIdType",0x30,0,3); FUN_11acaba0("bfname",0x4c,0,3); uVar1 = FUN_103173f0(0x14,"execFilenames");
+  puVar2 = FUN_10638fb0(1); *puVar2 = uVar1; FUN_11acaba0("saveGameFilename",0x50,0,3);
+  FUN_11acac50(0x54,0,&DAT_12852dcc,0,3);` — so the descriptor *sizes* are `execLines` = 8 and
+  `execFilenames` = 0x14, and `&DAT_11fb178c`/`&DAT_11f8d78c` are the string `map`.
+- Account builder (`0x11348370` ↔ `0x11342af0`): `login` 4, `password` 8, `onlineKey` 0xc, `primaryAccount` 0x14,
+  `accountFlags` 0x18, `controllerIndex` 0x1c (registrar `0x11acb270`↔`0x11ab6e20`), `platformSpecificId` 0x20, plus
+  anonymous offsets `0x10`/`0x1d`/`0x1e` on `&DAT_12852d9c` ↔ `&DAT_1282f8cc`.
+- Gate chain that must pass before **any** descriptor is created, in two wrappers per module (`FC3.dll
+  0x1030f2b0` → `0x1030f430`, `FC3.dll 0x1030f250` → `0x1030f310`; FC3_d3d11 twins `0x103173f0` → `0x10317570`
+  and `0x10317390` → `0x10317450`). FC3.dll body: `if (DAT_128042fc == '\0') FUN_11789a00(); if (DAT_12162beb
+  != '\0') { iVar1 = FUN_1177f7c0(); if (iVar1 != 0) goto create; } if (FUN_118db560() == 0) return 0; create:
+  return FUN_1030f430(size, name);` (`0x1030f2b0` takes `(size, name)`, `0x1030f250` takes none). FC3_d3d11
+  body: gates `DAT_128293f4`→`FUN_1179a990()`, `DAT_12187c6b`→`FUN_11790750()`, `FUN_118e8340()` →
+  `FUN_10317450()` (`0x103173f0` takes `(size, name)`, `0x10317390` takes none).
+- World/spawn builder (`FC3.dll 0x113425c0`, guard `DAT_12805498`): pushes the object returned by `FUN_1030f200`
+  (0 if the gates fail) and writes `world` 4, `pos` 8 (`&DAT_11f15f68`, registrar `0x11ab6a10`), `spawnPtId` 0x18,
+  anonymous `0x21` on `&DAT_1282f95c` and `0x20` as `iVar1 + 0x14`. FC3_d3d11 twin `0x11348480` (guard
+  `DAT_1282a609`) writes `abortEngineUpdateFlag` 0x14 (registrar `0x11acafc0`) + anonymous
+  `0x10`/`0x18`/`0x19`/`0x1a`/`0x1b` on `&DAT_12852d84`.
+- **Descriptor ctor family** (identical slot layout in both modules; slot *n* = object + 0x<*n*4>):
+  `0x1030f310` ↔ `0x10317450` writes slot1 = `"GameOpInfos"`, slot2 = strlen helper `FUN_11788030` ↔
+  `FUN_11798fc0` applied to that name, slot3 = 0 (flag byte), slot4 = 3, slot5 = 4, slot7 = `"infos"`, slot9 =
+  data pointer `&DAT_11f167b6` ↔ `&DAT_11f31ea8`, slot10 = `0xffffffff`, vtable `&PTR_FUN_11f90de0` ↔
+  `&PTR_FUN_11fb4d70`, purecall thunk `&PTR_purecall_11f0ebec` ↔ `&PTR_purecall_11f321ac`. `0x1030f430` ↔
+  `0x10317570` is the same shape with slot1 = the caller-supplied name, slot5 = `param_1`, slot7 = the literal
+  `"command"`. `0x1030f130` ↔ `0x10317270` is the destructor: for object slots `0x12`/`0x13`/`0x14` it runs
+  `LOCK(); iVar1 = *piVar2; *piVar2 = *piVar2 + -1; UNLOCK(); if (iVar1 == 1) FUN_100945e0();` ↔
+  `FUN_10174710()`, then two `FUN_11788aa0()` ↔ `FUN_11799a30()` calls and resets the vtable to
+  `&PTR_FUN_11f0e9c4` ↔ `&PTR_FUN_11f31f88` ⇒ intrusive `lock xadd` refcounts at object +0x48/+0x4c/+0x50.
+- The record object itself (`FC3.dll 0x1030f200` ↔ `FC3_d3d11.dll 0x10317340` — **not** `0x10317450`), from
+  bounded disassembly `local/scratch/rd_fc3_1030f1f0.txt` / `local/scratch/rd_d3d_10317330.txt`: purecall vtable
+  `0x11f0ebec` ↔ `0x11f321ac`, then the name literal **`"Data"`** at object +4 (`0x11f0ecc0` ↔ `0x11f32280`),
+  the length helper call `0x11788030` ↔ `0x11798fc0` stored at +8, intermediate vtable `0x11f0edfc` ↔
+  `0x11f323bc` with `+0x10 = 3` and the helper's return copied into `+0x14`, `+0x18`, `+0x1c`, `+0x20`, then the
+  real vtable `&PTR_FUN_11f90dac` ↔ `&PTR_FUN_11fb4d3c`, and object +0x24 = `0x11341420` ↔ `0x11346ca0`.
+- That +0x24 target is a **3-byte thiscall getter**, identical in both modules:
+  `mov al, byte ptr [ecx + 0x21]; ret` (FC3.dll `0x11341420`, FC3_d3d11.dll `0x11346ca0`) — a flag predicate, not
+  a tick. Ghidra does not export either thunk as a pseudocode file, so the pairing came from `region_dump.py`.
+- The per-object **update/execute** tick is `FC3.dll FUN_11341340` ↔ `FC3_d3d11 FUN_11346bc0` (`this` in `ECX`,
+  Ghidra ranges `0x11341340-0x11341417` ↔ `0x11346bc0-0x11346c97`, real epilogue `ret 4` at `0x11341415` /
+  `0x11346c95`; padding then holds the accessor thunks). Their pseudocode is line-for-line identical: flag bytes
+  +0x55, +0x5f, +0x19, +0x1a, +0x5e, +0x17, +0x1c, +0x57, +0x26, +0x5d; calls `FUN_113401c0` ↔ `FUN_11345a40`,
+  the object vtable slot +0x54, `FUN_1133fbe0` ↔ `FUN_11345460`, `FUN_116332b0(100)` ↔ `FUN_11644220(100)`,
+  `FUN_11341280` ↔ `FUN_11346b00`, logs the wide literal **`L"ExecuteEvent"`** via `FUN_1030fb90` ↔
+  `FUN_10317cd0` (clearing +0x57), then `FUN_10c47220` ↔ `FUN_10c4d740`. Its last block gates on the singleton
+  `DAT_12805180` ↔ `DAT_1282a2f8`: reads byte `(*(singleton + 4) + 0x205)`, calls that object's vtable slot +0x28,
+  and on success sets **`DAT_12805e42 = 1`** ↔ **`DAT_1282afba = 1`**.
+- Consumers of that flag pair: `FC3.dll 0x10c47320`/`0x10c473b0`/`0x10c477c0`/`0x10c47a00` ↔ `FC3_d3d11.dll`
+  `0x10c4d840`/`0x10c4d8d0`/`0x10c4dce0`/`0x10c4df20` (reads/clears `DAT_12805e41`/`DAT_12805e42` ↔
+  `DAT_1282afb9`/`DAT_1282afba`). Inside `FUN_10c473b0` ↔ `FUN_10c4d8d0` the gated path calls
+  `FUN_1069fbe0` ↔ its twin and `FUN_10504b50(handle, L"ExecuteEvent")` ↔ its twin — the scripted-event
+  execution path, once per object (it sets the guard byte at object +0xe8).
+- Adjacent accessor thunks (FC3.dll ↔ FC3_d3d11.dll): `0x11341420` ↔ `0x11346ca0` (`mov al, byte ptr [ecx + 0x21]`),
+  `0x11341430` ↔ `0x11346cb0` (`mov dword ptr [eax + 4], ecx`), `0x11341440` ↔ `0x11346cc0` (`mov al, byte ptr
+  [eax + 0x5c]`), then FC3_d3d11-only `0x11346cd0` (set byte +0x5c), `0x11346ce0` (`add eax, 0x30`), pair getters
+  `0x11346cf0` (+0x28/+0x2c), `0x11346d00` (+0x18/+0x1c), `0x11346d10` (+0x10/+0x14), setters `0x11346d20` (+0x40),
+  `0x11346d30` (+0x3c), `0x11346d40` (+0x38). All end with `ret` and sit in the padding region after the tick.
+
+### The class that owns the record tables: guarded factory + its vftable (2026-11-05)
+
+The dead end "the snapshot thunks `0x118531c0` / `0x11863de0` have no E8 callers and only one absolute reference
+each" is **resolved: those addresses are virtual-function slots**, so no slot table is listed in the PE data
+directories — the pointer lives in a vftable in `.rdata` that a factory in `.text` installs.
+
+| FC3.dll | FC3_d3d11.dll | role |
+|---|---|---|
+| `FUN_111e9540` (`0x111e9540`-`0x111e9597`) | `FUN_111eeed0` (`0x111eeed0`-`0x111eef27`) | guarded creator: allocates the object and installs its vftable |
+| `&PTR_FUN_11fbb2c0` (`.rdata 0x11fbb2c0`) | `&PTR_FUN_11fdf198` (`.rdata 0x11fdf198`) | the vftable it installs |
+| slots `+0x00 0x1039ed60`, `+0x04 0x1039ed00`, `+0x08 0x104833e0` | `0x103a5e90`, `0x103a5e30`, `0x10005920` | other virtual slots |
+| slot **`+0x0c` = `0x118531c0`** | slot **`+0x0c` = `0x11863de0`** | ensure-table thunk: builds the record table once, then returns the container global |
+| slots `+0x10 0x113418e0`, `+0x14 0x1033ebf0`, `+0x18 0x1039ed50`, `+0x1c 0x104833e0` | `0x11347160`, `0x1013e460`, `0x103a5e80`, `0x10005920` | remaining slots |
+| slot `+0x20 0x11853120` | slot `+0x20 0x11863d40` | sibling accessor |
+
+Factory pseudocode, index-for-index identical (`local/scratch/rea/pseudo-fc3dll-v2/functions/0x111e9540.c` ↔
+`pseudo-d3d11-v2/functions/0x111eeed0.c`):
+
+```c
+if (DAT_128042fc == '\0') FUN_11789a00();        if (DAT_128293f4 == '\0') FUN_1179a990();
+if (DAT_12162beb != '\0')                          if (DAT_12187c6b != '\0')
+  { if (FUN_1177f7c0() != 0) goto ok; }             { if (FUN_11790750() != 0) goto ok; }
+if (FUN_118db560() == 0) return 0;               if (FUN_118e8340() == 0) return 0;
+ok: puVar2 = FUN_11341d40();                     ok: puVar2 = FUN_113475c0();
+    *puVar2 = &PTR_FUN_11fbb2c0;                     *puVar2 = &PTR_FUN_11fdf198;
+    return puVar2;                                 return puVar2;
+```
+
+- Same gate triple as the descriptor wrappers documented above (`FUN_11789a00`/`FUN_1177f7c0`/`FUN_118db560` ↔
+  `FUN_1179a990`/`FUN_11790750`/`FUN_118e8340`), so this factory sits in the same initialize-once subsystem; the
+  allocator twins are `FUN_11341d40` ↔ `FUN_113475c0`.
+- The `+0x0c` thunk is guarded by a byte flag, FC3.dll `0x1280562f` ↔ FC3_d3d11.dll `0x1282a7a7`: `cmp byte
+  [flag],0; jne skip; call 0x11853140 / 0x11863d60; mov byte [flag],1; ret`, and the variant stored in the slot ends
+  with `mov eax,0x128334a0` / `mov eax,0x12856970` = **return the container global**. So the record table is built
+  **once, lazily, on the first virtual call of slot `+0x0c`**, and `0x11853140`/`0x11863d60` are the runners
+  (record builder + clone, above).
+- Class-descriptor strings sit next to the vftables: `CFCXGOContextNode`, `CFCXGOContextFlagsNode`, `IGameFileData`,
+  `CCampaignGameFileData`, `CFCXGameModeContextNode`, `CFCXGameModeContextFlagsNode`, `CFCXGameMode` (FC3.dll
+  `0x11fbb294`, `0x11fbb2a8`, `0x11fbb2e4`, `0x11fbb2f4`, `0x11fbb34c`, `0x11fbb364`, `0x11fbb384`; FC3_d3d11.dll
+  `0x11fdf16c`, `0x11fdf180`, `0x11fdf1bc`, `0x11fdf1cc`, `0x11fdf224`, `0x11fdf23c`). The record-table owner is in
+  the **game-object / game-file-data / game-mode context** family — the family that carries a session request, which
+  is why `-exec` / `-execline` values end up as session parameters (`execLines`) rather than being run as console
+  commands.
+- The referencing dword is in `.text` in both modules (FC3.dll `0x111e9588` → `0x11fbb2c0`, FC3_d3d11.dll
+  `0x111eef18` → `0x11fdf198`); it is the `mov *puVar2, offset …` operand of the factory, not a separate table.
+- A second `.text` reference to the sibling class descriptor: FC3.dll `0x1039edd4` → `0x11fbb2e4` (`IGameFileData`)
+  ↔ FC3_d3d11.dll `0x103a5f04` → `0x11fdf1bc`.
+- **How the creator is reached.** `FUN_111e9540` / `FUN_111eeed0` have **0 `E8` callers and 9 absolute references**,
+  one per entry of a sibling-class registry in `.rdata`: FC3.dll `0x11fbaf44` (file `0x1fba144`) ↔ FC3_d3d11.dll
+  `0x11fdee1c` (file `0x1fdd41c`), stride `0x28`, entries `af44, af6c, af94, afbc, afe4, bb00c, bb034, bb05c, bb084`
+  ↔ `ee1c, ee44, ee6c, ee94, eebc, eee4, ef0c, ef34, ef5c` — the registry is `0x37c` bytes before the vftable. Entry 0
+  FC3.dll `111e9540 111e94e0 1030d1d0 1039e3c0 104833e0 111e9fd0 111e8e10 113433b0 111e9460 111e95a0` ↔ FC3_d3d11
+  `111eeed0 111eee70 103a56f0 103a5470 10005920 111ef960 111ee7a0 11348c30 111eedf0 111eef30`: field 0 = the guarded
+  creator, field 1 = its sibling entry point, and fields 4 (`0x104833e0` ↔ `0x10005920`), 7 (`0x113433b0` ↔
+  `0x11348c30`) and 9 (`0x111e95a0` ↔ `0x111eef30`) are identical in entries 0-7, while field 2 is `0x1030d1d0` ×4 /
+  `0x1039e640` ×3 ↔ `0x103a56f0` ×4 / `0x103a5750` ×3 and field 3 walks an `0x50`-strided series (`0x1039e3c0,410,
+  460,4b0,500,550,5a0,5f0` ↔ `0x103a5470,4c0,510,560,5b0,600,650,6a0`). **Entry 8 is a different family** (FC3.dll
+  `100519c0 1030df50 10122130 104ef020 1039e780 103feb40 102dac70 100055a0` ↔ FC3_d3d11 `1027d850 102a8ea0 10241570
+  1046b300 103a5890 10104c00 10316060 10005880`). This shape — one creator shared by nine sibling classes — matches the
+  descriptor names documented above (`CFCXGOContextNode`, `CFCXGOContextFlagsNode`, `IGameFileData`,
+  `CCampaignGameFileData`, `CFCXGameModeContextNode`, `CFCXGameModeContextFlagsNode`, `CFCXGameMode`).
+- Probe files: `local/scratch/rd_reg_table_fc3.txt`, `local/scratch/rd_reg_table_d3d.txt`,
+  `local/scratch/rd_table_slot_scan.txt` (slot ownership + raw bytes), `local/scratch/rd_snapshot_callers.txt`
+  (guard-once thunks). Note `local/scratch/rd_disasm.py` needs **four** arguments `<pe> <start_va> <end_va>
+  <out_file>`; with three it prints nothing. `local/scratch/fc3_region_dump.py` dumps a `.rdata` range as dwords with
+  the name/string decoding: `<pe> <va_start> <va_end> <out>`; it needs the image base (both 1.06 modules are
+  `0x10000000`, PE32 magic `0x10b`) because the section table stores RVAs — FC3.dll `.rdata` = VA `0x11bcb000`..`0x12092d21`
+  from file `0x1bca200`, FC3_d3d11.dll `.rdata` = VA `0x11be1000`..`0x120b7347` from file `0x1bdf600`.
+
+**Open questions (this area):** ~~decompile `0x10638fb0` (FC3_d3d11.dll) and `0x1003b4b0` (FC3.dll) to get
+the element type of an exec record~~ — resolved: 4-byte pointers, appended by count. Confirm that the consumers `FC3_d3d11.dll 0x11348360` /
+`FC3.dll 0x11342a2e` walk `[0x12852dcc]`/`[0x1282f8fc]` in registration order; who writes the parsed
+`-exec` string into the container `[0x12829424]` under the key `execLines` (known call site
+`0x11785e60`, return offset `[eax+0x28]`); ~~which FC3.dll function owns the slot-9 code pointer~~ — resolved:
+`0x11341420` ↔ `0x11346ca0` are byte-identical flag getters (`byte [this + 0x21]`), and the tick they guard is
+`FC3.dll FUN_11341340` ↔ `FC3_d3d11 FUN_11346bc0`; and whether `Exec` (`0x11fbda40`, handler pointer stored at
+`0x111f5c71`) is reachable from that container at launch. **New:** which of the nine registry entries owns the record
+table (`0x118531c0` ↔ `0x11863de0` is its slot `+0x0c`), who iterates the registry at `0x11fbaf44` ↔ `0x11fdee1c` at
+time, and what entry 8's family is.
+
+## TODO
+
+- [x] Confirm game version and install path with owner (1.06, H:/Uplay/Far Cry 3/)
+- [x] Set up test copy of FC3 outside store folder (H:/FarCryCoop/TestFC3/)
+- [x] Repo decision (2026-11-02): own fork of this game repo — `peperonid/FarCry3Coop`
+  (forked from `Bantila/FarCry3Coop`) — the working copy of this game. The pipeline fork
+  `peperonid/FarCryCoop` keeps other games (`games/far-cry`, `games/far-cry-6`). The owner's
+  `backup` branch is left untouched.
+- [x] Phase 2: verify game launches with -offline (confirmed, main menu shows)
+- [ ] Phase 2: navigate to Co-op menu, start host session, test client connect
+- [ ] Decompile `FUN_106518ba` (host) and `FUN_10651d10` (client) to understand the direct connect path
+- [ ] Decompile `0x108c4b09` to confirm the "not enough players" check hypothesis
+- [ ] Find what creates the session object and fills the slots in the single-player build
+- [ ] Owner downloads scubrah's mod (Nexus 220) for comparison
+- [x] Name the import at IAT slot `0x11be1618` (`FC3_d3d11.dll`) = `MSVCR100.dll:strstr`; `-exec` /
+  `-execline` are parsed by the game DLL itself (see the console-command section below)
+- [ ] Decide whether option (b) can be replaced by arg injection through `-exec` / `-execline`
+  (needs: which consumer executes the extracted string, and whether `Exec` `0x11fbda40` is reachable at launch)
+  — progress: `execLines` is now known to be a **session-operation parameter** registered at
+  `FC3.dll 0x113429ca` next to `map`/`mapId*`/`bfname`, and the `-exec` values land in the global
+  container `0x12829424`; the consumer is still unproven, and two new dead ends are recorded:
+  registration blocks `0x111f4eab` (fc3_d3d11, `exec`/`Game:Exec(%%)`) and `0x104e5f42`
+  (`CFCXRunBatchFileOperation`) have 0 E8 callers (CRT init), and the handler pointer at
+  `0x111f5c71` is passed in a register.
+- Still open: who calls vftable slot `+0x0c` (`0x118531c0` ↔ `0x11863de0`) — a virtual call has no `E8` near-call
+  form, so the next probe is the callers of the factory (`FUN_111e9540` ↔ `FUN_111eeed0`), and the session-creation
+  call the coop knowledge base maps as **vftable slot `+0x74`** of the session object (`FC3.dll 0x11a8d0c5`-
+  `0x11a8d0eb`: `call 0x11341dc0`; `mov ecx,[eax]`; `mov eax,[ecx]`; `mov eax,[eax+0x74]`; `call eax`; session
+  destructor `0x11343640`, vftable `0x11f90644`, fields freed at `[obj+0x98]`/`[obj+0x9c]`).
+- The FC3_d3d11 functions `0x111eed50`, `0x111eedf0`, `0x111eec50`, `0x111eecb0` all read/write fields `+0x98` and
+  `+0xa4` (`if (*(int *)(in_ECX + 0xa4) == -1 && *(int *)(in_ECX + 0x98) != 0) { *(undefined4 *)(in_ECX + 0xa4) =
+  *(undefined4 *)(*(int *)(in_ECX + 0x98) + 0x10); … }`), which matches the session object's `[obj+0x98]` layout —
+  this is the family to pair next. Next probe: the 180-byte session-parameter struct at
+  `FC3.dll 0x10a8d0db` (`lea edx,[ebp+0x10]`) and the session object field `[obj+0x98]`.
+- [ ] Launch-bridge re-test with the **test copy's own uplay id**: `python -I games/far-cry-3/tools
+  /fc3_upc_probe.py --uplay-id <id> --wait 60`, run only after the canonical game process is closed
+  (`H:/Uplay/Far Cry 3/bin/farcry3_d3d11.exe` pid 31948 was still running on 2026-11-02, which made upc exit
+  0 immediately — the `OpenMutexA("FarCry3Instance")` single-instance guard).
+- [x] Fix `scripts/fc3_reloc_xref.py`: DONE 2026-11-03. The old premise (disp32 global accesses need
+  reloc walking) was wrong — disp32 fields in `.text` hold the default image-base VA verbatim (that is what
+  produced the 17 502 hits for `0x12829424`), while walking `.reloc` yields loader patch sites only, which is
+  why every lookup used to return 0. The rewritten tool scans the ModRM disp32 forms (`8b`/`89`/`8d`/`81`/`83`,
+  `c6`/`c7`, `ff /6`/`ff /7`, `ff /2`, `0f b6/b7/be/bf`, optional `66`/`f2`/`f3`), verifies every byte hit by
+  backward-decoding up to 15 bytes with capstone, scans writable sections for stored pointers, and reports
+  relocation patch sites separately (`--mode code|reloc|both`). `va2off()` was also fixed from
+  `off if off < min(rawsz, len(self.d))` to `off if ptr <= off < ptr + rawsz and off < len(self.d)`.
+- [ ] Enumerate the rest of the `Game.*` console-command table (`0x111cd3f5`..`0x111cf52f`) and find a
+  command that starts or joins a co-op session (`MissionSetState`, `SaveGame`, `Exec`, `RunBatch`)
+- [ ] Find the file behind `HubUtils.cpp (208) Test/dev args file present.` in the Ubisoft Connect log
+- [x] Confirm what `-coop` (`0x11fdc0cc`, refs `0x11aa08d3` / `0x11aa0cfc`) enables in 1.06: RESOLVED
+  2026-11-05 in the launch-mode cascade body `FC3.dll 0x11a8c440` (`-coop` compare at `0x11a8c533`, mode
+  id `0x43521e6f` read from `[0x1216aee4]`, written to `[ebp+8]`, then stored into object field
+  `[ebx+0xa4]` before the dispatch `call`); mirrored in `FC3_d3d11.dll` at `0x11aa08d4` (reads
+  `[0x1218ffe4]`) and in the second chain at `0x11a8c95d`, whose fully decoded mirror is
+  `FC3_d3d11.dll 0x11aa0cfc .. 0x11aa0d7a` (the same flag set, with the id written into local slot
+  `[ebp+0xc]`). Still open: what the second chain `FC3.dll 0x11a8c944 .. 0x11a8c9c1` selects (that
+  range is mid-instruction, so the enclosing function entry has to be found first), and whether the
+  mode id reaches the session-descriptor registry: RESOLVED 2026-11-06 - it is registered into the launch/mode object `[0x12804acc]` by the pair `0x1119dec0` / `0x1119f910` (see the launch-mode registration item below).
+  Then test `-execline` / `-exec` on the test copy `H:\FarCryCoop\TestFC3\` and watch the Ubisoft Connect
+  log plus `screenshot\`
+- [x] Size the real 1.06 session-descriptor record: RESOLVED 2026-11-03 — the array is an array of 4-byte
+  pointers indexed by a count (`lea eax, [eax + ecx*4]`), FC3.dll `[0x1282f8fc]` + count `[0x1282f900]`,
+  FC3_d3d11.dll `[0x12852dcc]` + count `[0x12852dd0]`; the element object holds the hkVirtual descriptor at
+  offset 0. See the section "Session-descriptor record tables" above. Still open: the element size of an exec
+  record (creators `0x1003b4b0` / `0x10638fb0`).
+- [x] Locate the game-mode registry and its fill routine: RESOLVED 2026-11-06 — the container
+  `[0x128048c0]` is filled from `engine\gamemodes\GameModesConfig.xml` (string `0x11f16940` in `FC3.dll`;
+  loader `0x117568a0`, called from `0x117569f0`, which then asks the loaded record for
+  `GameModeProperties` `0x11f16968` through `mov edx,[eax+0x58]` / `call edx` at `0x117569ba..0x117569c5`);
+  the fill routine is `0x11709af0 .. 0x11709ca0`: child count `[ecx]+0x4c` (`0x11709b03`), child by index
+  `[eax]+0x50` (`0x11709b1c`), name check `push 0x11f10d78 'GameMode'` + vtable `[edx+0x14]`
+  (`0x11709b35..0x11709b3d`), entry allocation `mov edx,0x10; lea ecx,[edx+0x30]; call 0x1177f7c0`
+  (`0x11709b5c..0x11709b64`), entry initialization `mov dword ptr [eax], 0x11f224b4` (`0x11709b86`),
+  `mov dword ptr [eax+0x20], 0xffffffff` (`0x11709ba1`, the id the `cmp dword ptr [ebx+0x20], esi` scan at
+  `0x1181cf13` matches), `movss [eax+0x28], xmm0` from `[0x11ef3764]`, `mov word ptr [eax+0x34], 0x100`
+  (`0x11709bb6`), `mov byte ptr [eax+0x36], 1` (`0x11709bbc`), then `call 0x11969740` (`0x11709bcc`).
+  Still open: which XML attribute writes the mode id into `[eax+0x20]`.
+- [x] Check whether co-op exists as a game mode in the shipped 1.06 data: RESOLVED 2026-11-06 — yes.
+  `H:\FarCryCoop\TestFC3\data_win32\worlds\downloadcontent\mp_dlc1\toc.rml` (1989 bytes) contains
+  `GameModes Desc FCXCoop`, and both of its maps carry `gamemodemask 128`: `mpdlc1_aegir` (`id 3001`,
+  `presenceId 690271114`) and `mpdlc1_idun` (`id 3002`, `presenceId 3534781404`); the same file registers
+  `ClassService CharacterAppearancesCoopULC` with `yuriy_ulc_2`, `leonard_ulc_2`, `tisha_ulc_2`,
+  `callum_ulc2`. `FCXCoop` also appears inside the packages: `multicommon/multicommon.dat` has 1 hit
+  (`_FCXCoop.207146615258375806` at file offset 407859421) plus `MZoneEntity_Coop_Island.2070649460439908519`
+  (350109489) and `MZoneEntity_Coop_ToRockets.2077132487061948236` (350279600) among 331 `Coop` hits;
+  `downloadcontent/mp_dlc1/mp_dlc1.dat` has 5 hits (`DynLoad/ … Mode/FCXCoop)` at offsets 68659542,
+  69112499, 120652426, 121131557 and `_FCXCoop.2077257745930653048` at 160905944); `fc3_main/fc3_main.dat`
+  (3496061837 bytes) has 1 hit at offset 2379019038 in the same `DynLoad/ … Mode/FCXCoop)` shape plus 331
+  `Coop` hits, among them DOMINO reflection-box categories `<Display Category="Coop|Group" …` (1304419581,
+  1304592795) and DOMINO script functions `Coop/Group/AddTo…` (400798582), `Coop/Entity/Is…` (1030651053),
+  `Coop/AllP…` (1088269141, 1312711018). Negative result: `grep -a -c -i gamemodesconfig` across every
+  `data_win32/*.dat` and `*.fat` returned 0 hits, so the XML itself is not stored as plaintext in this copy.
+- [x] Confirm the co-op classes are referenced by code, not only present as strings: RESOLVED 2026-11-06 —
+  `CFCXCoopService` `0x11fc3d3c` is pushed at `0x103ca3aa`, `0x11020fe9`, `0x11021004`; `CFCXCoopGateService`
+  `0x11fc5384` at `0x103d141a`, `0x11833c19`, `0x11833c34`; `CFCXCompetitiveCoop` `0x11ff136c` at
+  `0x10466e1a`, `0x11047bd1`, `0x11047bec`; `CFCXCompetitiveCoopNetFunc…` `0x11ff1334` at `0x10466c80`,
+  `0x10467704`; `CoopBarks` `0x11fd9c1c` at `0x11120455`; `SupportedGameModes` `0x11fa84bc` at `0x10351eb7`
+  and at `0x10351ebe mov dword ptr [esi + 4], 0x11fa84bc`. Service and console names are registered through
+  the pair `push <name>` + `call 0x10a00be0`, and a whole-`.text` scan counts 1817 such calls with 842
+  distinct names (`local/scratch/console_cmds.txt`). Consequence for patching: the mode ids live only in
+  `FC3.dll` while `FC3.exe` is a 213 KB stub, so a co-op-enabling patch belongs in `FC3.dll`, not `FC3.exe`.
+
+- **Launch-mode registration table `FC3.dll 0x1119dec0 .. 0x1119df9a` and `0x1119f910 .. 0x1119fa42`**
+  (the link between the cascade ids and the game object **`[0x12804acc]`**): the first function pushes
+  each id address into the object with `mov eax, dword ptr [0x12804acc]` + `add eax, 4` +
+  `push <id VA>` + `call 0x1029eb00`, in order `0x1216caac` (`0x1119dec6`), `0x1216ca9c` (`0x1119ded8`),
+  `0x1216ca90` (`0x1119deea`), `0x1216caa4` (`0x1119defc`), `0x1216caa8` (`0x1119df0e`), `0x1216aee4`
+  `-coop` (`0x1119df20`), `0x1216aedc` `-deathmatch` (`0x1119df32`), `0x1216af0c` default (`0x1119df44`),
+  `0x1216aeec` `-domination` (`0x1119df56`), `0x1216aef4` `-headquarters` (`0x1119df68`), `0x1216aefc`
+  `-firestorm` (`0x1119df7a`), `0x1216af04` `-dash` (`0x1119df8c`), ends `pop ecx; ret` (`0x1119df99`).
+  The second registers one handler per id with `mov esi, dword ptr [0x12804acc]` + `add esi, 4` +
+  `push <handler>` + `push <id VA>` + `call 0x1029edc0`: `0x11152dd0` pairs `0x1216caac` (`0x1119f927`),
+  `0x11152f50` pairs `0x1216ca9c` (`0x1119f93f`), `0x11a7a2e0` pairs `0x1216ca90` (`0x1119f957`),
+  `0x11a5a290` pairs `0x1216caa4` (`0x1119f96f`), `0x11a5a0b0` pairs `0x1216caa8` (`0x1119f987`),
+  **`0x11a5a6e0` pairs `0x1216aee4` `-coop`** (`0x1119f99f`), `0x11a7aff0` pairs `0x1216aedc`
+  (`0x1119f9b7`), `0x11a7aa00` pairs `0x1216af0c` (`0x1119f9cf`), `0x11a7ae80` pairs `0x1216aeec`
+  (`0x1119f9e7`), `0x11a7ad00` pairs `0x1216aef4` (`0x1119f9ff`), `0x11a7ab80` pairs `0x1216aefc`
+  (`0x1119fa17`), `0x11a5a560` pairs `0x1216af04` (`0x1119fa2f`), ends `pop esi; ret` (`0x1119fa41`).
+  New helpers: `0x1029eb00` (register id), `0x1029edc0` (register handler).
+- **Co-op mode constructor `FC3.dll 0x11a5a6e0 .. 0x11a5a772`** (the handler bound to `-coop`): gates on
+  `cmp byte ptr [0x128042fc], 0` then `call 0x11789a00` (`0x11a5a6ea..0x11a5a6f2`) and
+  `cmp byte ptr [0x12162beb], 0` (`0x11a5a6f7`); allocates with `mov edx,0x10; lea ecx,[edx+0x30];` +
+  `call 0x1177f7c0` (`0x11a5a6ff..0x11a5a707`, fallback `mov eax,0x10; lea edi,[eax+0x30];` +
+  `call 0x118db560` at `0x11a5a710..0x11a5a718`); initializes `[obj] = 0x11f23408` (`0x11a5a721`),
+  `[+4]..[+0x2c] = 0`, `[+0x30] = 0xffffffff` (`0x11a5a748`), `[+0x34]` word and `[+0x36]` byte = 0; then
+  rewrites the vtable to **`0x11fbb838`** (`0x11a5a756`) and stores the launch id:
+  `mov ecx, dword ptr [0x1216aee4]` (`0x11a5a75c`) then `mov dword ptr [eax + 0x30], ecx` (`0x11a5a762`);
+  returns 0 when a gate fails (`0x11a5a76b`). Field **`+0x30`** is the field both coop tests read
+  (`[0x12804acc]` then `+0x68`, then `mov eax,[eax+0x30]`, then `cmp eax,[0x1216aee4]` at
+  `0x1111e4d4/0x1111e4e3` and `0x1111e907/0x1111e916/0x1111e91e`).
+- **Second launch-mode chain, entry RESOLVED: `FC3.dll 0x11a8c8b0 .. 0x11a8d110`** (the previously
+  "mid-instruction" range `0x11a8c944 .. 0x11a8c9c1` is inside this function). Arguments are parsed
+  through `mov edi, dword ptr [0x11bcb5c0]` (`0x11a8c8bc`) + `call edi`: `-login` `0x11fb8170`
+  (`0x11a8c8c2`); error path `push 0x11fb81b4` = `'Invalid parameters for -host, missing (-login)'`
+  (`0x11a8c8d6`, `0x11a8c8e6`) then `call 0x10a00be0` / `call 0x10001ed0` then `xor al,al; ret 0xc`
+  (`0x11a8c8f2..0x11a8c8fa`); then `-host` `0x11f0e6ac` (`0x11a8c90b`, getter `call 0x11a08190`),
+  `-bfname` `0x11fb7d64` (`0x11a8c919`), `-dedicated` `0x11f0e7dc` (`0x11a8c927`), `-sessionuid`
+  `0x11fb81f0` (`0x11a8c935`), `-deathmatch` (`0x11a8c943`), `-coop` `0x11fb81fc` (`0x11a8c95c`),
+  `-domination` `0x11fb8204` (`0x11a8c976`), `-headquarters` `0x11fb8210` (`0x11a8c990`), `-firestorm`
+  `0x11fb8220` (`0x11a8c9a6`), `-dash` `0x11fb822c` (`0x11a8c9c0`). The mode id lands in the local slot
+  `[ebp+0xc]` (`-coop` `0x11a8c96b mov ecx,[0x1216aee4]` then `0x11a8c971 mov [ebp+0xc],ecx`;
+  `-deathmatch` `0x11a8c952 mov eax,[0x1216aedc]` then `jmp 0x11a8c9df`; default `0x11a8c9da
+  mov eax,[0x1216af0c]` then `0x11a8c9df mov [ebp+0xc],eax`) and is then stored into the launch object
+  and dispatched: `0x11a8c9e2 mov ecx,[ebp+0xc]` then `0x11a8c9ea mov dword ptr [esi + 0xa4], ecx`,
+  `mov edx,[esi]` / `mov eax,[edx+0x14]` / `mov ecx,esi` / `call eax` (`0x11a8c9e5..0x11a8c9f2`),
+  `mov eax,[edx+0x18]; call eax` (`0x11a8c9f6..0x11a8c9fb`), `push [ebp+0x10]; mov edi,esi;` +
+  `call 0x119696d0` (`0x11a8c9fd..0x11a8ca03`), `lea edx,[esi+4]; push edx; push ebx;` +
+  `call 0x11a8bdc0` (`0x11a8ca08..0x11a8ca0d`), `mov eax,[esi+0x9c]; lea edi,[ebp-0xc];` +
+  `call 0x11341c60` (`0x11a8ca12..0x11a8ca1b`), `mov ecx,[edi+0x9c]; add eax,0x4c; cmp ecx,eax`
+  (`0x11a8ca20..0x11a8ca2c`). Coop-specific branch: `0x11a8cabb mov ecx,[ebp+0xc]` then
+  `0x11a8cabe cmp ecx, dword ptr [0x1216aee4]` then `0x11a8cac4 jne 0x11a8cb17` then
+  `0x11a8cac6 push 0x11fb7fb8` = **`-class`**, `push ebx;` + `call dword ptr [0x11bcb5c0]`
+  (`0x11a8cacb..0x11a8cacc`) — `-coop` asks for a mode-class name here.
+- **Mode-registry getters and the availability mask (verified 2026-11-06)**: `FC3.dll 0x117094a0` and
+  `0x117094d0` resolve one registry record by mode id — `ecx` = id-global VA, `eax` = registry container
+  (`[0x128048c0]`): `mov edx, dword ptr [ecx]` (the id), count `mov ecx, dword ptr [eax+8]`, array base
+  `mov esi, dword ptr [eax+4]`, `lea ecx, [esi+ecx*4]`, loop `mov esi, [eax]` / `cmp dword ptr [esi+0x20],
+  edx` (`0x117094b4` / `0x117094e7`), on match `mov edx, [eax]` then `mov eax, dword ptr [edx+0x24]`
+  (`0x117094c7` / `0x117094fa`) — record field **`+0x24`**, which `0x117094d0` ANDs against its second
+  argument: `test dword ptr [ebp+8], eax; setne al; ret 4` (`0x117094fd..0x11709504`), and on miss
+  `xor eax,eax` then the same test (`0x11709507..0x1170950f`). `0x117094a0` returns the field directly
+  (`ret` at `0x117094ca`, `xor eax,eax; ret` at `0x117094cb`). The per-mode gate loop is
+  `FC3.dll 0x10f3cd30 .. 0x10f3d260`: mask source **`mov <reg>, dword ptr [ebx + 0xc4]`** (`0x10f3cfd0`,
+  `0x10f3cff3`, `0x10f3d015`, `0x10f3d03c`, `0x10f3d063`) pushed as the mask argument, registry
+  `mov eax, dword ptr [0x128048c0]` (`0x10f3cfc9`, `0x10f3d01c`, `0x10f3d042`, `0x10f3d069`), candidate
+  ids `mov ecx, 0x1216af04` (`-dash`, `0x10f3cfd7`), `0x1216af0c` default (`0x10f3cffa`), `0x1216aeec`
+  (`-domination`, `0x10f3d021`), `0x1216aef4` (`-headquarters`, `0x10f3d048`), `0x1216aefc` (`-firestorm`,
+  `0x10f3d06f`), each `call 0x117094d0` + `test al,al`; on success `push <id VA>` (`0x10f3cfe9`,
+  `0x10f3d008`, `0x10f3d02f`, `0x10f3d056`, `0x10f3d07d`) + `push edi` + `mov ecx, ebx` +
+  `call 0x11258cc0` (`0x10f3d00d..0x10f3d010` and siblings), gate `cmp dword ptr [esp+0x20], 1`
+  (`0x10f3cfc4`), end `mov eax, edi; call 0x11257550` (`0x10f3d08a`). Other id reads:
+  `mov edx, dword ptr [ecx*4 + 0x1216b114]` (8-entry id table). Note the shipped 1.06 data uses
+  `gamemodemask 128` on both `FCXCoop` maps (`worlds/downloadcontent/mp_dlc1/toc.rml`, see the
+  "co-op exists as a game mode" item above), which is the shape this record field `+0x24` / caller mask
+  `[obj+0xc4]` compares against.
+- [ ] Decode what `-class` resolves in the coop branch of `0x11a8c8b0`: verified that `push 0x11fb7fb8`
+  (`-class`) + `push ebx` + `call dword ptr [0x11bcb5c0]` at `0x11a8cac6..0x11a8cacc` is the argument
+  presence test, that the value fetch is `lea eax,[ebp+0xc]` + `mov dword ptr [ebp+0xc],0` +
+  `call 0x11a08190` (`0x11a8cad9..0x11a8cae9`), the name lookup `mov eax,[esi+0x9c]` + `lea edi,[ebp+0xc]`
+  + `call 0x11341b80` (`0x11a8caee..0x11a8cafa`), then a reference-count release `lock xadd dword ptr
+  [eax], edx` (`0x11a8cb09`) and `mov eax,edi; call 0x100945e0` (`0x11a8cb10..0x11a8cb12`); the next
+  argument is `-spawn` `0x11fb7fc0` (`0x11a8cb17..0x11a8cb1d`)
+- [ ] Find the callers of the co-op mode constructor `0x11a5a6e0` and what writes `[0x12162beb]` /
+  `[0x128042fc]` (its two gates)
+- [x] Partially resolved 2026-11-06: that region is the per-mode install chain of the mode manager
+  (see the "Mode-manager object and the mode registry" section). Still unread: the region head
+  `0x1119fa50` (400 instructions, already dumped in `local/scratch/probe36.txt`) and the per-mode
+  object builders `0x11a5a0b0`, `0x11a5a290`, `0x11a5a560`, `0x11a7a2e0`, `0x11a7aa00`, `0x11a7ab80`,
+  `0x11a7ad00`, `0x11a7ae80`, `0x11a7aff0`
+- [x] RESOLVED 2026-11-06 — it IS the same object, installed at `0x117567ce`; see the
+  "Mode-manager object and the mode registry" section below. The suspicion that the two shapes
+  differ (registration writes id-global addresses like `push 0x1216aee4`, the coop test compares the
+  id VALUE) was wrong: `+0x68` is the registry pointer and `+0x6c` is an ownership flag.
+- [ ] Phase 3: story script patches for multi-player
+
+## Mode-manager object and the mode registry (2026-11-06, FC3.dll 1.06, `local/scratch/probe53.py` .. `probe56.py`)
+
+- **`[0x12804acc]` is installed by `0x117567ce mov dword ptr [0x12804acc], esi`** (`FC3.dll
+  0x117567c0 .. 0x11756810`): primary vftable `0x11f16a3c` (`0x117567c4`), a second vftable
+  `0x11f1bdc0` at `+4` (`0x117567d4`) and at `+0x30` (`0x117567ed`), sub-objects built at `+8`
+  (`lea ecx,[esi+8]` + `call 0x106bdde0` at `0x117567cb/0x117567db`) and `+0x34`
+  (`lea ecx,[esi+0x34]` + `call 0x106bdde0` at `0x117567ea/0x117567f4`), fields `+0x24/+0x28/+0x2c`
+  and `+0x50..+0x64` zeroed (`0x117567e0..0x11756808`), a third sub-object at `+0x70`
+  (`lea ecx,[esi+0x70]`, `0x1175680b`). It is cleared twice: `0x11756f37 mov dword ptr [0x12804acc],
+  ebx` after `call 0x106bde10` (`0x11756f31`), and `0x10048100 mov dword ptr [0x12804acc], 0` inside
+  the deleting dtor `0x100480f0` (`mov dword ptr [esi], 0x11f169dc` at `0x100480fa`).
+- **The registration API `0x1029eb00` is fed the map at `obj+0x30`**: `mov eax, dword ptr [ebp+8]` +
+  `add eax, 0x30` + `call 0x1029eb00` (`0x117567ab..0x117567b1`). The launch-mode registration
+  `0x1119dec0` uses the same API with `add eax, 4`; that offset difference is still open.
+- **`engine\gamemodes\GameModesConfig.xml` (`0x11f16940`) has exactly two references, both in one
+  function `0x117568a0`**: `mov ecx, dword ptr [0x12804308]` (`0x117568a6`) → `mov eax,[ecx]` +
+  `mov edx,[eax+0x10]` (`0x117568ae`) → `push 0x11f16940` (`0x117568b5`) → `call edx` (`0x117568ba`);
+  false path `mov dword ptr [edi], 0` (`0x117568c0`), true path `push 0; push 0x11f16940;
+  lea eax,[esp+0xc]; push eax` (`0x117568cd..0x117568d8`).
+- **Registry container `[0x128048c0]` has one creator and one releaser**: created by `0x10048230`
+  (`mov dword ptr [eax], 0x11f224c4` at `0x10048271`, fields `+4..+0x18` = 0, published at
+  `0x10048289` and `0x10048297`); released in the mode-manager destructor `0x11756e00`:
+  `mov ecx, dword ptr [0x128048c0]` (`0x11756e03`) → if non-null `mov eax,[ecx]` + `mov edx,[eax]` +
+  `push 1` + `call edx` (`0x11756e1a..0x11756e20`) → `mov dword ptr [0x128048c0], ebx` (`0x11756e25`);
+  the manager's own `+0x68` pointer is released with `push eax; call 0x11701470`
+  (`0x11756e34/0x11756e35`) only when the ownership byte `[esi+0x6c]` is set
+  (`cmp byte ptr [esi+0x6c], bl` at `0x11756e2f`, cleared at `0x11756e3a`). This confirms the co-op
+  test path `+0x68` and that `+0x6c` is a flag, not a pointer.
+- **Per-mode install helper `0x11756dc0 .. 0x11756dfc` (`ret 0x10`)**: `mov edx, dword ptr [ebp+0x10]`
+  (mode id) + `mov esi, dword ptr [ebp+8]` (manager) + `lea eax,[esi+0x30]` + `call 0x118cea00`
+  map lookup (`0x11756ddc/0x11756ddf`), on hit `push esi; lea ecx,[esp+0x18]; call 0x11756a50`
+  (`0x11756de8..0x11756ded`), result byte read at `mov al, byte ptr [esp+0x13]` (`0x11756df2`).
+- **The install chain `0x1119fa50 .. 0x111a0a6b` has three groups** (22 `call 0x11756a50` sites at
+  `0x111a0870..0x111a0a6a`): group A `call 0x103d2b20` for 11 ids (`0x111a0880..0x111a0966`, co-op
+  `0x1216aee4` at `0x111a0944`), group B `call 0x103d2b90` for 5 ids (`0x111a097d..0x111a09d9`:
+  `0x1216aedc`, `0x1216af0c`, `0x1216aeec`, `0x1216aef4`, `0x1216aefc`), group C `call 0x103d2c00`
+  for 6 ids (`0x111a09f0..0x111a0a63`, adds `0x1216ca9c`). Co-op appears only in group A.
+- Group services: `0x103d2b20` pushes the class name `CFCXConsoleService` (`0x11fc5760`) and the mode
+  factory `0x11a746b0`; `0x103d2b90` pushes `CFCXMultiPlayerConsoleService` (`0x11fc5568`) and the
+  factory `0x10fad580`; `0x103d2c00` is the third variant (`mov al, bl; ret 8` at
+  `0x103d2c63..0x103d2c6b`). All three return a bool and are called only from this chain.
+- **`0x11756c50` (`ret 0x10`) refuses the install when the id is absent from `[0x128048c0]`**
+  (record field `+0x20`, scan `cmp dword ptr [ebx+0x20], edi` at `0x11756c82`, miss path
+  `xor al,al; ret 0x10` at `0x11756ca5..0x11756cad`); on success it passes the gates
+  `cmp byte ptr [0x128042fc],0` + `call 0x11789a00` (`0x11756cb0..0x11756cb9`) and
+  `cmp byte ptr [0x12162beb],0` (`0x11756cc5`) and allocates with `mov edx,0x10; lea ecx,[edx+0x10];
+  call 0x1177f7c0`.
+- **Mode registration is re-run by a shutdown/re-init driver at `0x111f3b30`** whose head is
+  `mov edi,ecx; call 0x111f22c0; cmp byte ptr [edi+0xb3],0; je 0x111f3c52`: it calls `0x1119f920`
+  (`0x111f429b`), `0x1119fa50` (`0x111f42a0`), `0x1119dfa0` (`0x111f42a5`) after a release loop
+  (`lock xadd dword ptr [eax], edx` + `mov eax,[ecx]` + `mov edx,[eax+4]` + `call edx` at
+  `0x111f42dd..0x111f4327`, `mov edi, dword ptr [0x12804b88]` (`0x111f42eb`), `call 0x11938250`
+  (`0x111f42f5`), `call 0x1039c5b0` (`0x111f4304`)).
+- Small accessor `0x111f3ae0 .. 0x111f3b2b`: `mov eax,[0x12804acc]` + `cmp byte ptr [eax+0x6c],0` +
+  `mov eax,[eax+0x68]` + `push eax; call 0x1039c880` + `push eax; call 0x1116d760`, then
+  `[0x12805450]` → `0x1135e720`, `[0x1280564c]` → `0x111e1c00`, `[0x128055ec]` vtable slot `+0xc`,
+  `[0x1280563c]` → `0x111e44d0`.
+- `0x111a0860` and `0x111a0a70` have **zero** direct E8/E9 callers: `0x111a0860` is reached by
+  fall-through inside `0x1119fa50`; `0x111a0a70` is a thunk (`push ecx; call 0x1119f920;
+  call 0x1119fa50; call 0x1119dfa0; pop ecx; ret` at `0x111a0a70..0x111a0a81`) whose only internal
+  call sites are `0x111a0a71/0x111a0a76/0x111a0a7b`, so its entry must be reached through a jump
+  table or a data reference (open).
+- Sibling mode builder `0x11a746b0 .. 0x11a74745` (used by `0x103d2b20`): same gates
+  (`cmp byte ptr [0x128042fc],0` → `call 0x11789a00`; `cmp byte ptr [0x12162beb],0`), allocation
+  `mov edx,0x10; lea ecx,[edx+0x40]` (0x50) `call 0x1177f7c0`, init `[obj] = 0x11f169e8`,
+  `[+0x1c] = 0xffffffff`, `[+0x48] = 7`, final vftable `mov dword ptr [eax], 0x1200cf78`
+  (`0x11a74732`).
+- Open: who calls `0x117567c0` / `0x117568a0`; what the `obj+0x30` map (`0x118cea00`) holds; who
+  writes `[obj+0x68]` and sets `[obj+0x6c]`; why `0x1119dec0` uses `add eax,4` but `0x117567ae` uses
+  `add eax,0x30`; the consumers of `0x1068f590` / `0x11851c40` callback registrars at
+  `0x103d2c6e` / `0x103d2ce0`.
+
+
+## Registry object: its allocation, constructor chain and the thirteen-entry table (2026-11-06, FC3.dll 1.06, `local/scratch/probe73.py` .. `probe81.py`)
+
+- `0x111f3b30` is **not** a jump-table target: its only data reference is vftable slot `+0x44` of
+  `0x11fba838` (`0x11fba87c`). RVA-form scans of `0x011f3ae0`, `0x011f3b30` and `0x0039c250` return
+  zero hits, so the registry is reached through vftables and tail-jump chains, not jump tables.
+- `0x11fba838` is the shared vftable of the thirteen registry sub-objects: exactly thirteen write
+  sites, all inside the builder `0x1039c250 .. 0x1039c580`, at offsets `0x20, 0xb0, 0x140, 0x1d0,
+  0x260, 0x2f0, 0x380, 0x410, 0x4a0, 0x530, 0x5c0, 0x650, 0x6e0` (stride `0x90`). Its slots include
+  the scalar deleting dtor `0x1039c580` at `+0x00` and `+0xac`, plus mid-function entries
+  `0x111f3d10` (`+0x24`) and `0x111f3b30` (`+0x44`).
+- Each sub-object ctor is `0x100013c0`: `mov ecx,esi; call 0x106dfa60` + `[esi+0x10] = 0x10238ce0` +
+  mask initialisation from the global `0x1217c698` (`mov eax,[0x1217c698]; mov [esi+4],eax`, then a
+  bit-mask loop with `shl ecx,cl` / `not eax` / `and` / `or` / `add ecx,2` / `shr eax,1`).
+  `0x106dfa60` is the base init: `[esi+8] = -1`, `[esi+0xc] = 0`, `[esi+4] = 0`, then `0x1217b420` +
+  `call 0x106f6fb0`, `[eax+4] = 0`, `[ecx] = 0`, `mov [esi],eax`, `lock xadd dword ptr [ecx],1`.
+- Handler addresses pushed into the thirteen entry ctors: `0x111f1070`, `0x111edbd0`, `0x111f22c0`,
+  `0x111f26c0`, `0x111f22a0`, `0x111f26e0`, **`0x111f3ae0` for the entry at `+0x380`** (push site
+  `0x1039c3e4`), `0x111f20a0`, `0x111f0a90`, `0x111f2140`, `0x111f0a30` three times. Entry `+0x380`
+  is the entry whose handler is the co-op accessor `0x111f3ae0` (`mov eax,[0x12804acc]` +
+  `cmp byte ptr [eax+0x6c],0` + `mov eax,[eax+0x68]`).
+- Manager constructor `0x1039c030 .. 0x1039c250` (`this` in `esi`): `call 0x106db0d0`; four init
+  groups (`lea edi,[esi+0x15c]` twice with stride `0x24` → `0x106ce850`; `lea ebx,[esi+0x1a8]` twice
+  with stride `0x48` → `0x106ce8b0`; `lea edi,[esi+0x280]` twice with stride `0x84` → `0x106d3ed0`);
+  then `lea edi,[esi+0x388]; call 0x1039c250` — the thirteen-entry table lives at manager offset
+  `+0x388` and its entry pointers are published at `+0x128..0x158` as `&esi+0x3a8, 0x438, 0x4c8,
+  0x558, 0x5e8, 0x678, 0x708, 0x798, 0x828, 0x8b8, 0x948, 0x9d8, 0xa68`. Tail registrars:
+  `push 0xd; push edi; mov ecx,esi; call 0x106bc890`, `push 2; lea eax,[esi+0x280]; call 0x106bc860`,
+  `push 2; lea eax,[esi+0x15c]; call 0x106bc8b0`, `push 3; push ebx; call 0x106bc8e0`; epilogue
+  `mov eax,esi; ret`. Inline callback pairs `(0x111edac0, 0)`, `(0x1039cc20, …)`, `(0x1039b990, 0)`
+  are registered through `call 0x106bc7b0` with `ecx` = `&esi+0x1f0` and `&esi+0x238`.
+- Reference census over every executable section (`local/scratch/calls.json` caches 721 985 rel32
+  call/jmp refs, 178 197 distinct targets): `0x1039c250` has one caller (`0x1039c09c`),
+  `0x1039c030` one (`0x1039b719`), `0x1039b710` one (`0x111f4fcf`), `0x111f3ae0` one (`0x111f3c54`),
+  and the teardown `0x1039d020` has thirteen (`0x1039b877..0x1039b97c`).
+- Allocation site (`0x111f4f9f..0x111f501d`): after `call 0x1039a420`, `call 0x1039ab60` and the
+  shared launch gate pair `cmp byte ptr [0x128042fc],0` → `call 0x11789a00` (`0x111f4fa9`,
+  `0x111f4fb2`), the object is created with **`mov eax,0x10; mov edi,0xaf0; call 0x118db560`**
+  (`0x111f4fb7`) — **size 0xaf0**, alignment 0x10 — and stored as `mov esi,[esp+0x14]` …
+  `mov dword ptr [esi+0xd4], eax` (`0x111f4fc6`, `0x111f4fd8`) after `push esi; call 0x1039b710`
+  (`0x111f4fce..0x111f4fcf`).
+- The entries are consumed immediately afterwards: `mov ecx,[0x12807738]; push ecx; mov ecx,eax;
+  call 0x106eac80` (`0x111f4fde..0x111f4fe7`), then `mov eax,[esi+0xd4]; mov edx,[0x12807740];
+  mov ecx,[eax+0x12c]; mov ecx,[ecx+0x24]; push edx; call 0x106e96c0` (`0x111f4fec..0x111f5002`) and
+  the same pattern for the next entry through `[eax+0x130]` with global `[0x12807744]`
+  (`0x111f5007..0x111f501d`): the published `+0x128..0x158` array is the dispatch table, each entry's
+  member at `+0x24` is passed as `this` to `0x106e96c0` with a per-entry global from
+  `[0x12807738 + n*4]`.
+- Corrections to earlier notes: the claim "thunk `0x11010ee0` → `0x12163234`" is wrong (`0x11010ee0`
+  bytes are `0c 00` followed by `0xcc` padding). `0x12162beb` has 14 218 `.reloc` patch sites and they
+  **are** memory references (`cmp byte ptr [0x12162beb], bl`-style reads); the older claim that they were
+  `cmp eax,0x12162beb`-style immediates came from a raw byte scan. The gate reading stays
+  `cmp byte ptr [0x12162beb],0` inside `0x11756c50`.
+- Tooling note: raw scans must use the section's raw pointer (`pe.d[ptr:ptr+rawsz]`); the earlier
+  `probe72.py` used the virtual offset as a file offset (`pe.d[sv:sv+vsz]`), which made every scan
+  return zero. `FC3.exe` is not present in `H:\FarCryCoop\TestFC3\bin\` (only `FC3.dll`,
+  `FC3_d3d11.dll`, `SandBar.dll`, `SandDock.dll`, `binkw32.dll`, `FC3Editor.*`, `FC3Updater.exe`);
+  the working copies are `E:\FarCryCoop\Work\fc3\FC3.exe`.
+- Open: who allocates the container whose field `+0xd4` receives the manager (`mov esi,[esp+0x14]` at
+  `0x111f4fc6`); what `0x118db560`, `0x106eac80` and `0x106e96c0` do exactly; which of the thirteen
+  entries is the co-op one at runtime (entry `+0x380` is the only one whose handler is the co-op
+  accessor); the consumers of `[0x12807738]`, `[0x12807740]`, `[0x12807744]`; whether the
+  `[0x128042fc]` / `0x11789a00` pair is the launch-argument check that has to be bypassed.
+
+## Agent session (2026-11-06): the launch switch -> mode id chooser, and the mode id table
+
+Sources: static disassembly of `H:\FarCryCoop\TestFC3\bin\FC3.dll` (v1.06, sha256
+`71d58a7a4503c5c67dcd6f4b9445b5e7ac34c12043987f4c7285e13f2ed51c9b`), scripts
+`local\scratch\probe101.py`..`probe110.py` (scratch only, not tracked). All addresses are 1.06
+`FC3.dll`; `FC3_d3d11.dll` has the same structure at different addresses (its coop hash global is
+`0x1218ffe4`, coop hash occurrences in 8 functions).
+
+### The switch parser that picks the mode id
+
+`0x11a8c440` is the netgame launch parser (prologue `55 8bec 83ec2c 53 8b5d14 56 8b750c 57` =
+`push ebp; mov ebp,esp; sub esp,0x2c; push ebx; mov ebx,[ebp+0x14]; push esi; mov esi,[ebp+0xc]`
+= argv). It uses `mov edi,[0x11bcb5c0]` (a `strcmp`-like scanner imported from the C runtime at
+`FC3.dll+0x11bcb5c0`) as `push <switch string VA>; push argv; call edi`, and writes a **mode id
+constant** into the caller's out parameter. Verified chain tail verbatim: `-deathmatch` ->
+`mov eax,[0x1216aedc]` (`0x11a8c529`); **`-coop` (`push 0x11fb81fc` at `0x11a8c533`) ->
+`mov ecx,[0x1216aee4]` (`0x11a8c542`) -> `mov [ebp+8],ecx` (`0x11a8c548`)**; `-domination` ->
+`[0x1216aeec]`; `-headquarters` -> `[0x1216aef4]`; `-firestorm` -> `[0x1216aefc]`; `-dash` ->
+`[0x1216af04]`; **no switch matched -> `mov eax,[0x1216af0c]` (`0x11a8c5b1`) ->
+`mov [ebp+8],eax` (`0x11a8c5b6`)**. Earlier in the same function are `-login`, `-ip` (with the
+error string `Missing -login or -ip for -client.` at `0x11fb8258`), `-online`, `-password`,
+`-bfname`, `-sessionuid`. A second copy of the same chain lives in `0x11a8c8b0` (`-host` at
+`0x11a8c90b`, `-coop` at `0x11a8c95c` -> `mov [ebp+0xc],ecx`), which is also the caller of
+`0x11a8c440` (the only rel32 call, at `0x11a8d000`); `0x11a8c8b0` is reached from `0x11a8cf45` and
+`0x11a8d045`. `0x11a8c440` therefore only runs when the process is started with network launch
+arguments - a normal single-player start never reaches it.
+
+### Mode ids are 32-bit hashes, stored in a .data table next to `0x1216a00c`
+
+`FC3.dll .data` dump (each id followed by a `0xffffffff` terminator), verified with
+`local\scratch\probe106.py`: `0x1216aedc = 0x8b40f692` (-deathmatch), `0x1216aee4 = 0x43521e6f`
+(**-coop**), `0x1216aeec = 0xab4fc8e2` (-domination), `0x1216aef4 = 0x9991daec` (-headquarters),
+`0x1216aefc = 0xf66ffb87` (-firestorm), `0x1216af04 = 0x2100ced7` (-dash),
+`0x1216af0c = 0x6c2b3868` (**the mode used when no switch is given**), `0x1216aed0/0x1216aed4 =
+0x9ba82025`, `0x1216af14 = 0x1577a45d`, `0x1216af18 = 0xfe80eafc`, `0x1216af1c = 0xa9fc2652`. The
+neighbouring slots `0x1216aeb8`, `0x1216aeb0`, `0x1216aea8` hold string pointers (`World`
+`0x11f0f5c4`, `PersistenceDB` `0x11fbad38`, `CampaignSave` `0x11fbad28`), so this block is the
+named-session registry: name string + 32-bit hash id pairs, exactly the `push <name VA>; push
+<hash>` registration shape already recorded for the world/session records (see the earlier
+section "the registry is keyed by 32-bit hashes").
+
+### Where the coop hash is used (probe107-probe112)
+
+- `0x1133fb80` is a 50-byte predicate (`0x1133fb80`..`0x1133fbb2`, verified byte-by-byte in
+  `local\scratch\p111.txt`): `mov eax,[eax]` then `cmp` against `0xab4fc8e2`, `0x43521e6f` (coop),
+  `0x9991daec`, `0x6c2b3868`, `0xf66ffb87`, `0x2100ced7`, each followed by `je 0x1133fbaf`; the fail
+  path is `xor al,al; ret` at `0x1133fbac`, the success path `mov al,1; ret` at `0x1133fbaf`. It
+  answers "is this id one of the network mode ids" and **`0x8b40f692` (-deathmatch) is deliberately
+  not in the list**. `0x113403e0` repeats the same six comparisons at `0x113405a4`, `0x11340623`,
+  `0x11340a26` and reads the registry `[0x128048c0]` at `0x113408fa`, `0x11340bdd`.
+- `0x11a7f9d0` asks the mode accessor for sessions by id: `mov ecx,[0x12804acc]; mov eax,[ecx];
+  mov eax,[eax+4]; lea edx,[esp+0x10]; mov [esp+0x14],0x80608f71; push edx; call eax`, and when that
+  returns false `mov ecx,[0x12804acc]; mov dword ptr [esp+0xc],0x43521e6f; mov edx,[ecx];
+  mov edx,[edx+4]; lea eax,[esp+0xc]; push eax; call edx` - i.e. **virtual slot +4 of the
+  `[0x12804acc]` object is a "find/lookup session by hash id" call**, first probed with
+  `0x80608f71` (another registered name, value not yet attributed) and then with the coop hash. If
+  either lookup succeeds the code continues into loading `engine\toolsconfig\AlwaysLoaded.xml`
+  (`push 0x11f2fd78` at `0x11a7fa2b`). This is a point where the game asks for a coop session
+  without any launch argument.
+- `0x10fa1710` is not a plain mode switch, it is a **session-name -> loading-screen-name chain**
+  (`local\scratch\p112.txt`). It tests candidate names against `[ebp+0xc]` with `call 0x1011cb30`:
+  `'coop_vidar'` (`0x1200e400`) -> `'COOP_Vidar_Loading'` (`0x1200e40c`), `'coop_sleipnir'`
+  (`0x1200e420`) -> `'COOP_Sleipner_Loading'` (`0x1200e430`), `'mpdlc1_aegir'` (`0x11f8a1b4`) ->
+  `'COOP_Freya_Loading'` (`0x1200e3cc`), `'mpdlc1_idun'` (`0x1200e448`) -> `'Coop_Fenrir_Loading'`
+  (`0x1200e38c`), all jumping to the shared tail at `0x10fa1c22`. Only after those name tests does
+  it compare the hash ids: `0x10fa1bb9` `0xab4fc8e2` (-> `push 0x1200e454 'PvP_Dom_Loading'`,
+  `call 0x10a00be0`, `push 0x1200e454`, `call 0x10001ed0`), `0x10fa1bde` `0x9991daec` (->
+  `'PvP_Pump_Loading'` `0x1200e464`), `0x10fa1bec` `0x8b40f692` (-> `'PvP_DeathMatch_Loading'`
+  `0x1200e478`), `0x10fa1bfa` `0x6c2b3868` (-> `'PvP_TeamDeath_Loading'` `0x1200e490`), `0x10fa1c08`
+  `0xf66ffb87` (-> `'PvP_FireStorm_Loading'` `0x1200e4a8`), `0x10fa1c16` `0x2100ced7` (->
+  `'COOP_Dash_Loading'` `0x1200e4c0`); the dash case is `COOP_`-prefixed, so the dash mode is
+  handled as a coop-family session. The chain ends at `0x10fa1c2b` with `push edx; push ebx;
+  call 0x110252d0`, then `mov eax,[0x12804b3c]; cmp dword ptr [eax+0x70],1; jne 0x10fa1ca0` and a
+  second id-compare block (`0x10fa1c45`..`0x10fa1c66`, domination / headquarters / deathmatch /
+  default / firestorm all branch to `0x10fa1c68`) where `mov esi,[esp+0x14]; mov edx,[esi+0xa0];
+  mov eax,[edx+0x64]; lea ecx,[esi+0xa0]; call eax` makes a virtual call at object offset `+0xa0`,
+  slot `+0x64`. `0x10fa1710` also uses `-online` (`push 0x11fb8234`) as a string test before the
+  hash comparisons.
+- `0x11204b00` is the second mode dispatcher: it reads `[esi+0x10]` and branches `0` ->
+  `0x1120590d`, `1` -> fall-through, otherwise -> `0x11205d99`, and compares ids at `0x11205732`,
+  `0x11205753`, `0x11205775`, `0x11205793`, `0x112057b1`. Both `0x10fa1710` and `0x11204b00` start
+  from the same accessor (`mov eax,[0x12804acc]; cmp byte ptr [eax+0x6c],0; mov eax,[eax+0x68]`).
+- `0x11341dc0` (31 rel32 callers, e.g. `0x10ce93c9`, `0x10edd676`, `0x10f3a0f9`, `0x10fcc522`) is
+  the mode/session getter used everywhere: `mov eax,[edi]; mov edx,[eax+0x10]; mov ecx,edi;
+  call edx; mov ecx,edi; call 0x10056690; push eax; call 0x11774ae0; mov [ebx],esi` - takes a mode
+  id pointer in `[ebp+8]` and returns the object (then calls its virtual slot +4 with `this`).
+- `0x11a7f820` starts with `cmp byte ptr [0x12804a09],0` and iterates a vector
+  `[0x12820c04]`/`[0x12820c08]` (`lea edi,[ecx+eax*4]`), with `0x11a7fa12` holding the coop hash;
+  it is the closest verified "iterate registered sessions and pick the coop one" loop found so far.
+- Negative results: `0x113403e0`, `0x10fa1710`, `0x11204b00`, `0x10fad5e0`, `0x10f0c770` have **no
+  rel32 callers** (reached through a vtable / function pointer), so their entry points need a
+  pointer-table scan or REA flow analysis; `0x113403e0` also has `int3` padding, i.e. it is a real
+  function start. `0x11204b00` and `0x10fa1710` are large functions (`sub esp,0xa94` in
+  `0x11204b00`) - per-mode graph setup, not a single switch.
+- `cstr`-mid-string pitfall: `0x11fb8218` is not the start of a switch name (`0x11fb8214` is
+  `0x11fb8210 '-online'`, so `0x11fb8218` reads as `rters` = tail of `...multiplayers`);
+  `0x11fb8228` is not a string either. Only `-online` (`0x11fb8234`) is real there.
+
+### Consequence for the mod
+
+The coop mode is not a flag the ASI can flip in one place: the game resolves a **hash id** through
+the `[0x12804acc]` object (virtual slot +4) and the registry `[0x128048c0]`, and the coop hash
+`0x43521e6f` is a constant baked into the executable and the data table. The smallest single-point
+candidates so far: make the "no switch given" branch at `0x11a8c5b1` load the coop hash instead of
+`0x6c2b3868`, or call the accessor's find-by-id with `0x43521e6f` directly (the pattern already
+exists at `0x11a7fa08`). Nothing here needs the launch arguments: `0x11a7f9d0` shows the game can
+ask the accessor for a coop session at any time. The coop *session names* the game itself uses
+(`coop_vidar`, `coop_sleipnir`, `mpdlc1_aegir`, `mpdlc1_idun` and their `*_Loading` partners) are a
+second, name-based route into the same coop sessions.
+
+- Script-fragile details already recorded elsewhere: the switch->mode-id chooser `0x11a8c440` /
+  `0x11a8c8b0`, the `FC3.dll .data` hash table at `0x1216aedc`..`0x1216af1c`, `FC3_d3d11.dll`
+  mirror (`0x1218ffe4`).
+- Next: resolve what virtual slot +4 of `[0x12804acc]` really is (REA pseudocode), resolve the
+  object at `[0x12804b3c]` offset `+0x70` and the `+0xa0`/slot `+0x64` call in `0x10fa1710`,
+  enumerate the registered name strings next to the hashes at `0x1216aeb8` / `0x1216aeb0` /
+  `0x1216aea8`, and see which of them the single-player launch registers; then a dynamic experiment
+  that asks the accessor for the coop session (`0x43521e6f`) in a running 1.06 process.
+### The launch-mode functions are virtual slots, not switch cases (probe132-probe137)
+
+`0x113403e0`, `0x10fa1710`, `0x11204b00`, `0x10fad5e0`, `0x10f0c770` have no `E8` caller
+because they are entries in class vftables in `.rdata`. `xlib.verified_xrefs` on the table
+*start* returns 0 hits; only slot addresses are referenced from code.
+
+Whole-image dword scan (`local/scratch/p131.py`, `.text` + `.rdata` + `.data`) - the five
+holders, with the slot index of each target:
+
+- `0x11f910c0` -> slot 5 `0x11341340`, slot 8 `0x1133fb30`, slot 12 `0x113403e0`,
+  slot 13 `0x1133fe20`, slot 20 `0x1133fbd0`, slot 22 `0x11340d90`. Slot 0 `0x1030f8c0`,
+  slot 1 `0x10007480`, slots 16-19 and 21 hold the pure-virtual filler `0x1061fee0`.
+  Installed by `0x11341070` (`mov dword ptr [ebx+0x3c],0x11f35e98` too), which also looks up
+  the serializable name `0x11f75a78` = `'CGameLoadingScreen'` (`push 0x11f75a78;
+  call 0x10a00be0`, then `push 0x11f75a78; call 0x10001ed0`), and does an
+  `lock xadd` ref-count pair on `[ebx+0x3c]`/`[ebx+0x40]`.
+- `0x11f91128` (installed at `[esi+8]` by `0x11340ec0`, `mov dword ptr [esi+0x3c],0x11f91130`)
+  -> slot 0 `0x1030fbf0`, slot 1 `0x1030f850`, slot 2 `0x1030fc00`, then the purecall stubs
+  `0x1008a7e0` / `0x1008a830` / `0x10089f80` and the small class `0x1165c760`..`0x1165c960`.
+- `0x1200e608` -> slot 4 `0x1133fb30`, slot 8 `0x113403e0`, slot 9 `0x1133fe20`,
+  **slot 11 `0x10fa1710`**, slot 1 `0x10fa1f30`, slots 12-18 `0x10fa13b0 0x10fa1200
+  0x10fa12e0 0x10fa11c0 0x10fa1160 0x10fa1530 0x10fa1d10`, slot 20 `0x11340560`,
+  slot 21 `0x10fa1170`, slots 22-23 `0x104df010` / `0x104de9d0`. It shares slots 0-10 with
+  `0x11f910c0` (`0x10c478a0` then `0x10390f00 0x1005bf70 0x1133fb30 0x10c471a0 0x10c47bf0
+  0x10c47600 0x113403e0 0x1133fe20 0x10c471b0`) and only differs from slot 11, so it is a
+  sibling class of the same hierarchy - a mode-specific variant that carries the whole
+  `0x10fa1xxx` method cluster (the launch-mode handler set).
+- `0x11fb5914` (interior of the vftable family whose dtor-shaped head is `0x11fb5844`,
+  installed at `[esi]` by `0x112046a0`/`0x11204a00`) -> slot 0 `0x10390fd0`, slot 2
+  `0x112073d0`, slot 3 `0x112029e0`, **slot 8 `0x11204b00`**, slot 9 `0x10391480`,
+  slot 20 `0x11204980`, slot 17 `0x11202bd0`. `0x11204a00` initialises the object:
+  `[esi+4]=0`, `[esi+8]=3`, `[esi+0xc]=0`, `[esi+0x14]=0`, `[esi+0x18]=-1`,
+  `[esi+0x1c]=-1`, `[esi+0x20]=0`, `[esi+0x24]=0`, self-referential list head at `[esi+0x28]`
+  (`mov [eax],eax; mov [eax+4],eax; mov [eax+8],0`), `push 0x400; lea ecx,[esi+0x3c]`.
+- `0x1200ac6c` -> **slot 8 `0x10f0c770`**, slot 1 `0x10fcad00`, slot 7 `0x10507f50`,
+  slot 9 `0x10f0cbe0`, slot 10 `0x10f0baf0`, slot 12 `0x10f0c0b0`, slot 13 `0x10f0cb60`,
+  slot 15 `0x104cedd0`, slot 16 `0x104cedc0`, slot 18 `0x11a58e90`. Slot 2-6 and 17 and 20
+  hold the pure-virtual filler `0x104833e0`.
+- `0x1200d820` -> **slot 8 `0x10fad5e0`**, slot 5 `0x116fb950`, slot 6 `0x10fb0570`,
+  slot 7 `0x10fb0ee0`, slot 9 `0x104da2a0`, slot 10 `0x10faf980`, slot 11 `0x10fad310`,
+  slots 12-14 `0x10fae850 0x10fae7d0 0x10fae740`, slot 17 `0x10faf910`, slot 18 `0x10fad340`,
+  slot 19 `0x10fb0510`, slots 20-21 `0x10fad330` / `0x10fad320`, slot 23 `0x104da280`.
+- Correction: `0x11f902b0`, `0x12009e48`, `0x1200c9f0`, `0x1200d7f8`, `0x11fb4a34` are NOT
+  tables - `0x11f902b0` is the class-name string `'CGOBuilderNode'` and `0x12009e48` is the
+  middle of a string (`'lities'`). `0x11f0ebec` (written by `0x1030d7b6 mov dword ptr
+  [edi],0x11f0ebec`) is not a vftable either: it is a Builder-node descriptor region whose
+  tail spells `'CVideoBuilderObject'`.
+- `0x11f5ad34` (73 dword sites, 65 of them in `.text`, 56 different functions, e.g.
+  `0x10048c80`, `0x10117620`, `0x111f5fe0`, `0x112046a0`, `0x11783510`) is a widely shared
+  base record, but its dump crosses into ASCII (`'NONE'`, `'Start'`, `'Stop'`, `'Form'`,
+  `'Spot'`, `'Soun'`) so it is a serializable-name/reflection record, not a plain vftable.
+- Slot references found in code (`local/scratch/p133.py`): `0x11f910c0+0x58` (slot 22) from
+  `0x11340ed4` (inside `0x11340ec0`); `0x11fb5914` slot 0 from `0x10390fdc` (`0x10390f60`),
+  slot 18 from `0x11204a50` (`0x11204a00`), slot 36 from `0x10fc3fd8` (`0x10fc3f30`), slot 63
+  from `0x112027d8` (`0x112027a0`); `0x1200ac6c` slot 11 from `0x10fcac1c` (`0x10fcab70`),
+  slot 15 from `0x104cedd8` (`0x104cedd0`) and `0x11a58df4` (`0x11a58d70`), slot 59 from
+  `0x11a585bc` (`0x11a585a0`); `0x1200d820` slot 17 from `0x10fad4b0` and slot 21 from
+  `0x10fad54c`, both inside `0x10fad4a0`. `0x1200e608` (the co-op-bearing vftable) has no
+  dword reference to its start or any slot from code, so the object is created by a
+  constructor that stores the address with a register-relative `mov [reg+disp],imm32`.
+- Consequence: to reach the co-op launch-mode handler statically one must find the code that
+  stores `0x1200e608` into an object field (a `mov dword ptr [reg+disp],0x1200e608` `c7` form,
+  since the vftable address itself never appears as a call target), not a call to `0x10fa1710`.
+  Hypothesis, not yet verified: the co-op mode object is constructed by a factory selected from
+  the mode-id registry rather than by an explicit named constructor.
+- `0x11789a00` is the only writer of `[0x128042fc]` found so far: it is a self-guarded init -
+  `cmp byte ptr [0x128042fc],0; jne 0x11789b63`, it stores three handlers `0x11789840`,
+  `0x117899e0`, `0x11789990` into the table at `0x121a7eb0`, calls the function pointer in
+  `[0x1217bc8c]`, sets `mov dword ptr [0x120931c8],0x121a7eb0`, then `0x11789a45 mov byte ptr
+  [0x128042fc],1`, and ORs `[0x1288c800]`. `[0x12162beb]` has a pure getter at `0x1177eba0`
+  (`mov al,byte ptr [0x12162beb]; ret`) and its only live byte store is `0x1177584a` inside
+  `0x11775800` (see the store-writer attribution section at the end of this file). The store at
+  `0x11774c4a` inside `0x11774b70` (a string-list routine: `push 0x11f15148; call 0x10a00be0` ->
+  `0x10004080`, then `0x11f1514c`, reading `[obj+0x14]` and `[obj+0x20]`) is not a census store site:
+  the aligned `.reloc` census reports exactly one store for this global.
+
+### The mode-object class behind the co-op consumer (probe143-probe149)
+
+The table I called `0x1200e608` is a mid-table entry. The real primary vftable is `0x1200e5f8` (53 slots), and its secondary interfaces are `0x1200e660` and `0x1200e668` (verified: `FarCry3Coop-bantila/local/scratch/p143.py`, `p146.py`). That explains why probe140 found no reference to `0x1200e608` — the code writes `0x1200e5f8`.
+
+The constructor is `0x10fa1eb0` and it is called from exactly one site, `0x1119a558` inside `0x1119a250`, which is the mode-registry registration function already recorded in these notes:
+
+```text
+10fa1eb0  55                       push ebp
+10fa1eb1  8bec                     mov ebp, esp
+10fa1eb3  51                       push ecx                     ; local slot for the registry id
+10fa1eb4  56                       push esi                     ; esi = this
+10fa1eb5  e8b6f13900               call 0x11341070              ; base ctor installs the 0x11f910b0 family
+10fa1eba  8d86a0000000             eax, [esi + 0xa0]            ; pointer to the sub-object at field +0xa0
+10fa1ec1  c706f8e50012             mov dword ptr [esi], 0x1200e5f8
+10fa1ec7  c7460860e60012           mov dword ptr [esi + 8], 0x1200e660
+10fa1ece  c7463c68e60012           mov dword ptr [esi + 0x3c], 0x1200e668
+10fa1ed5  e8f6ea2c00               call 0x112709d0              ; construct the +0xa0 sub-object
+10fa1eda  33c0                     xor eax, eax
+10fa1edc  898634010000             mov dword ptr [esi + 0x134], eax   ; three zeroed status fields
+10fa1ee2  8d4dfc                   ecx, [ebp - 4]
+10fa1ee5  898638010000             mov dword ptr [esi + 0x138], eax
+10fa1eeb  89863c010000             mov dword ptr [esi + 0x13c], eax
+10fa1ef2  6898138212               push 0x12821398              ; global registry object (all zeros in the image)
+10fa1ef7  c78640010000ffffffff     mov dword ptr [esi + 0x140], 0xffffffff
+10fa1f01  888644010000             mov byte ptr [esi + 0x144], al      ; cleared flag
+10fa1f0d  89864c010000             mov dword ptr [esi + 0x14c], eax
+10fa1f13  e868971bff               call 0x1015b680              ; string initialisation
+10fa1f18  8b55fc                   edx, [ebp - 4]               ; the value pushed by the caller
+10fa1f1b  899640010000             mov dword ptr [esi + 0x140], edx    ; store the registry id at +0x140
+10fa1f21  8bc6                     mov eax, esi                 ; return this
+10fa1f23  8be5 5d c3               mov esp, ebp; pop ebp; ret
+```
+
+The destructor at `0x10fa1e30` re-installs the same three vftables (that is what made the `0x1200e5f8` references look like a second constructor), then runs the sub-object destructor and the base destructor:
+
+```text
+10fa1e30  55 8bec 83ec18 56 57     push ebp; mov ebp,esp; sub esp,0x18; push esi; push edi
+10fa1e37  8bf9                     edi, ecx                     ; this
+10fa1e39  8b8740010000             esi, [edi + 0x140]           ; the stored registry id
+10fa1e3f  50                       push eax
+10fa1e40  be98138212               esi, 0x12821398
+10fa1e46  c707f8e50012             mov dword ptr [edi], 0x1200e5f8      ; destructor vftable install
+10fa1e4c  c7470860e60012           mov dword ptr [edi + 8], 0x1200e660
+10fa1e53  c7473c68e60012           mov dword ptr [edi + 0x3c], 0x1200e668
+10fa1e5a  e8e1491cff               call 0x10166840              ; string release (216 callers)
+10fa1e68  8d8f44010000             ecx, [edi + 0x144]
+10fa1e8e  c745ec9cff1f11           mov dword ptr [ebp - 0x14], 0x11f9cfc9
+10fa1ea0  5f 5e 8be5 5d c3         pop edi; pop esi; mov esp,ebp; pop ebp; ret
+10fa1ea5..0x10fa1eaf               int3 padding
+```
+
+Slot 0 of `0x1200e5f8` is the deleting destructor, which shows where the object is released from the manager:
+
+```text
+104de9e0  55 8bec 83ec0c           destructor entry (this in ecx)
+104de9ec  8bf1                     esi, ecx
+104de9ee  e83d34ac00               call 0x10fa1e30              ; body
+104de9f3  f6450801                 test byte ptr [ebp + 8], 1   ; "delete too" flag
+104dea00  83fe00 0f8410000000      esi == 0 -> skip, and bounds check against [0x121bbff8] / [0x121a7fdc]
+104dea0d  56                       push esi
+104dea0e  e89d8bffff               call 0x1177f5b0              ; operator delete
+104dea15  8b0d2c438012             ecx, [0x1280432c]            ; manager global
+104dea1b  e8304a5cff               call 0x106c2c50              ; remove-from-manager step
+104dea20  8bc6                     eax, esi
+104dea22  e8c98affff               call 0x117774f0              ; release / ref-count step
+104dea27  8b0d2c438012             ecx, [0x1280432c]
+104dea2d  e8ee495cff               call 0x106bde20              ; second manager step
+104dea32  8bc6 8be5 5d c20400      mov eax,esi; mov esp,ebp; pop ebp; retn 4
+```
+
+`0x104de9e0` has exactly one reference — the vftable entry itself — so the object is released only through a virtual call. The `+0xa0` sub-object destructor `0x11270920` installs `mov dword ptr [esi], 0x11fac4a0` and reads `[esi + 0x8c]` / `[esi + 0x90]`, which is the same accessor family already seen in `0x112710f0`; `0x11fac4a0` starts `0x10368ca0` then six `0x1008a7e0` (not-implemented) then `0x1008a830`.
+
+Meaning: the co-op consumer `0x10fa1710` is not a loose function — it is slot 15 of the co-op mode object, whose id is written at `+0x140` from the value the registration function pushes, and whose registry handle is the global `0x12821398`.
+
+### Which class reaches the gate globals directly (probe152)
+
+`p152.py` disassembled five more unclaimed slots of `0x1200e5f8`, and all of them read the gate
+globals already recorded in these notes, which is how the co-op mode object reaches session state
+without going through the launch-mode functions:
+
+```text
+10fa1f30  slot 5   mov eax, [0x12804b3c]; cmp dword [eax+0x70], 1 ; same gate check as 0x10fa1710
+                   mov ecx, [0x12804430]                          ; another gate global
+10fa13b0  slot 16  mov eax, [0x12804acc]; cmp byte [eax+0x6c], 0  ; the gate global 0x1119a250 reads
+                   call 0x1048c910; mov edx, [0x12805180]; call 0x114cb560; call 0x1100d2f0
+10fa12e0  slot 18  mov eax, [0x12804acc]; test byte [eax+0x40], 0
+10fa1160  slot 19  mov eax, [0x12804acc]; cmp byte [eax+0x6c], 0
+                   ... mov edi, [eax+0x68]; call 0x100fe7b0
+                   mov ecx, [esi+0x14]; call 0x104dec50   ; or, on the other branch,
+                   mov edx, [esi+0x14]; call 0x104ded10
+10fa1d10           cmp byte [edi+0x144], 0                      ; the flag the ctor cleared
+                   push 0x12821398; call 0x1015b7b0; call 0x115e35d0
+                   call 0x103a9ea0; cmp eax, [0x1216ca90]; cmp eax, [0x1216ca9c]; call 0x1117f530
+```
+
+Layout check: `0x1200e5f8` slots `+0x20` (`0x10fa1f30`), `+0x30` (`0x10fa12e0`), `+0x3c`
+(`0x10fa1160`) match exactly where `0x11341070` installs `0x11f910f0`, `0x11f91128`, `0x11f91114`,
+so the co-op object is a member of the `0x11f910b0` family with a co-op slot set.
+
+### The allocation helper that created the co-op mode object (probe153)
+
+`0x118db560` is now resolved: it is a manager-backed size-class allocation helper, and it is the
+call that produced the object passed to the co-op mode constructor at `0x1119a54d`:
+
+```text
+118db560  8b0d2c438012  mov ecx, [0x1280432c]     ; manager global as `this`
+118db566  56            push esi
+118db567  8bf0          mov esi, eax               ; eax = size requested
+118db569  e8e276defe    call 0x106c2c50            ; manager step, the same one the deleting destructor uses
+118db56e  83fe08        cmp esi, 8
+118db571  7718          ja 0x118db58b              ; size-class split
+118db573  8bc7          mov eax, edi               ; edi = the size the caller set (`mov edi,0x150` at 0x1119a548)
+118db575  e8f6c5e9ff    call 0x11777b70            ; allocate for size <= 8
+118db57a  8b0d2c438012  mov ecx, [0x1280432c]
+118db580  8bf0          mov esi, eax
+118db582  e89928defe    call 0x106bde20            ; manager step, the other one the deleting destructor uses
+118db587  8bc6 5e c3    mov eax,esi; pop esi; ret
+118db58b  8bd7 mov edx,edi; 118db58d 8bc6 mov eax,esi; 118db58f e8acc8e9ff call 0x11777e40  ; allocate for size > 8
+118db594..118db5a1      mov ecx,[0x1280432c]; mov esi,eax; call 0x106bde20; mov eax,esi; pop esi; ret
+```
+
+So allocation and release of the co-op mode object are bracketed by the same two manager calls,
+`0x106c2c50` on entry and `0x106bde20` on exit, both against the global `[0x1280432c]`. The NOTES
+open item "`0x118db560` unresolved" is closed.
+
+### What `0x11789a00` really installs: the game's custom allocator (probe155-probe158)
+
+The first 0x3c bytes of `0x11789a00` are a one-shot guard plus a three-slot handler table install:
+
+```text
+11789a00  cmp byte ptr [0x128042fc], 0        ; one-shot guard (the writer is 0x11789a00 itself)
+11789a07  jne 0x11789b63
+11789a0d  mov eax, dword ptr [0x1217bc8c]     ; optional callback slot
+11789a12  mov dword ptr [0x121a7eb0], 0x11789840
+11789a1c  mov dword ptr [0x121a7eb4], 0x117899e0
+11789a26  mov dword ptr [0x121a7eb8], 0x11789990
+11789a30  test eax, eax
+11789a32  je 0x11789a36
+11789a34  call eax                             ; call the installed callback if present
+11789a36  mov eax, 1
+11789a3b  mov dword ptr [0x120931c8], 0x121a7eb0   ; publish the table pointer into a .data global
+```
+
+So the installer writes its three handler addresses into the table `0x121a7eb0`/`0x121a7eb4`/`0x121a7eb8`,
+publishes a pointer to that table into the global `[0x120931c8]`, and calls whatever is in `[0x1217bc8c]`.
+Cross-references: the three handler addresses `0x11789840`, `0x117899e0`, `0x11789990` each have exactly one
+reference, the install site itself. The table address `0x121a7eb0` has two references: the install site and
+`0x11789a3b`. The slot `[0x1217bc8c]` is read at `0x10c56bf8`, `0x10c56ce4`, `0x10c56cf8`, `0x10c56d7a` and is
+touched at `0x106ed8bc`, `0x106efaa7`.
+RTTI lookup for `0x11fc6268` and `0x1200e5f8` failed: their `-4`/`-8` slots hold code addresses or non-pointers
+(`0x11fc6268-4 -> 0x104833e0`, `0x11fc6268-8 -> 0x11746490`, `0x1200e5f8-8 -> 0x66006e`), so neither table is a
+plain MSVC primary vftable with a CompleteObjectLocator.
+
+Probe158 corrects the label: `0x11789a00` is the game's custom-allocator initialisation, not a co-op install site.
+It is called lazily from `0x11789b70` (`call 0x11789a00` at `0x11789b81`, the sized `operator new` path) and from
+`0x117898c0` (`call 0x11789a00` at `0x117898d3`, the `operator delete` path), both behind `cmp byte [0x128042fc],0`.
+So `[0x128042fc]` means "allocator initialised", and the arena bookkeeping globals are `[0x121bbff8]`, `[0x121a7fdc]`
+and `[0x121a7fe0]` (`0x1177f560` picks the arena slot with `sub eax,[0x121bbff8]`, `shr eax,0x10`,
+`lea esi,[eax+eax*4]`, `lea esi,[esi*4+0x121a7fe0]`). Every earlier NOTES claim that `[0x128042fc]` is a
+launch-mode gate must be re-read with this correction: it is the allocator-initialised flag, not a mode gate.
+
+### Who builds the mode manager and what it registers (probe159-probe161)
+
+`0x111f4fc6` is the tail of the mode-manager setup. It takes the container in `[esp + 0x14]` (`esi`), creates the
+manager with `call 0x1039b710` (`0x111f4fcf`), stores it in the container field `[esi + 0xd4]` (`0x111f4fd8`), then
+registers three things on it:
+
+```text
+111f4fde  mov ecx, [0x12807738] ; push ecx ; mov ecx, eax ; call 0x106eac80    ; manager constructor argument
+111f4fec  mov eax, [esi + 0xd4] ; mov edx, [0x12807740]
+111f4ff8  mov ecx, [eax + 0x12c] ; mov ecx, [ecx + 0x24] ; push edx ; call 0x106e96c0
+111f5007  mov eax, [esi + 0xd4] ; mov edx, [0x12807744]
+111f500d  mov ecx, [eax + 0x130] ; mov ecx, [ecx + 0x24] ; push edx ; call 0x106e96c0
+111f5022  mov ecx, [esi + 0xd4] ; push 0 ; push esi ; call 0x106e46a0
+```
+
+So the manager's own sub-objects live at `[manager + 0x12c]` and `[manager + 0x130]`, each is reached through its
+`+0x24` field, and both are registered by `0x106e96c0` with the globals `[0x12807740]` and `[0x12807744]`; the final
+`call 0x106e46a0` hands the manager the container itself (`push 0; push esi`). The setup function returns `1` at
+`0x111f508c` (`ret 4`). The next function at `0x111f5090` is the matching teardown: it walks the array rooted at
+`[0x12805260]` (count at `[eax + 0xc]`, entries at `[eax + 8]`, each entry released through `call 0x11442150`),
+releases the array with `call 0x118830a0`, then closes `[0x128043f8]` via `call 0x11739ed0`, `[0x12804b14]` via
+`call 0x1161fef0`, `[0x12804b18]` via `call 0x1161ccc0` and `call 0x1161e1b0`, and `[0x128043c8]` via
+`call 0x11742100`.
+
+### Where the co-op mode id enters the mode table (probe172-probe190)
+
+`0x11199e80` is not an installer. probe186 disassembles it from the aligned function boundary and it is a small
+thunk that reaches the object stored at `[ecx + 0x14]`:
+
+```text
+11199e80  push ebp ; mov ebp, esp ; push esi
+11199e84  mov esi, [ecx + 0x14] ; test esi, esi ; je 0x11199e95
+11199e8b  push edi ; mov edi, [ebp + 8] ; call 0x1133fd30
+11199e94  pop edi ; pop esi ; pop ebp ; ret 4
+11199e9a  int3 (x6, padding up to 0x11199ea0)
+```
+
+`0x11199ea0` is a separate function and it has nothing to do with the mode table: it loads the FEU file
+`'UI\Singleplayer\Menu\Loading\loading.feu'` (`0x11fc6138`, pushed at `0x11199eab` and `0x11199ec3`), clears
+`[ebx + 0x10]`, calls `0x10a00be0` and `0x10001ed0`, reaches `[ebx + 0x14]` -> `[eax + 8]` (vtable slot 2, with
+`push esi` as an out-parameter), releases a reference with `or ecx, 0xffffffff` / `lock xadd dword ptr [eax], ecx`
+plus `call 0x100945e0`, and finally builds `{0x11f373cc, 0x11199d80, 0, 0, edx}` on the stack and calls
+`0x118b1810` with `ecx = 0x11fc6164`. `0x128040c0` and `0x6f1e5243` have zero verified xrefs, so the
+`[edi] = 0x128040c0`, `[edi + 4] = 0x2e0000` and `[edi + 8] = 0x43521e6f` lines and the "byte-swapped compare
+value" wording in this section were mid-instruction decode artifacts and are dropped.
+
+probe188 counts 11 verified xrefs of the co-op id `0x43521e6f`. The code sites are: `0x10f0c7e8`
+`mov dword ptr [esp + 0x6c], 0x43521e6f` (with `[esp + 0x54] = 0x11fafe90`), `0x10f4cb0a`
+`mov dword ptr [esp + 0xb8], 0x43521e6f` (with `[esp + 0xa0] = 0x11fafe90`), `0x10f9260a`
+`cmp dword ptr [esp + 0xc], 0x43521e6f` / `jne 0x10f9267d` right after `push edx` / `call eax` (a mode-id query
+that returns the id on the stack), `0x10fa1aa4` `cmp eax, 0x43521e6f` / `jne 0x10fa1bb8`, the two writers
+`0x1127995f` `mov dword ptr [0x12891ca0], 0x43521e6f` and `0x11279adf` `mov dword ptr [0x12891ca8], 0x43521e6f`
+(each guarded by `test byte ptr [0x12891ca4], al` / `or dword ptr [0x12891ca4], eax` and by the mirror
+`0x12891cac`, and each followed by `mov ecx, [ebx + 0x8c0]`), and the two mode-id compare chains `0x1133fb80`
+(`mov eax, [eax]` ; `cmp eax, 0xab4fc8e2` ; `je 0x1133fbaf` ; `cmp eax, 0x43521e6f` ; `je 0x1133fbaf` ;
+`cmp eax, 0x9991daec`) and `0x113405a0` (`mov eax, [ebx + 0x4c]` then the same three-way compare with
+`je 0x113405cd`). `0x11a7f820` and the data cells `0x1216a00c`, `0x1216aa40`, `0x1216aee4`, `0x12173ff4` inside
+the `0x11bcac20` blob are the remaining occurrences.
+
+The count-field pattern that the previous version of this section attributed to a mode accessor lives inside the
+pause-menu function `0x11007920`-`0x11007c70` (probe189): it calls `0x11168cf0`, reads `[0x12804acc]`
+(`cmp byte ptr [eax + 0x6c], 0`), loads `'UI\Singleplayer\Menu\Pause\M_PauseMenu.feu'` (`0x11fd18fc`) through
+`call 0x117872f0`, reads `[0x12804ac0]` (`lea edi, [eax + 0x38]`) and calls `0x103a2d50`, then at `0x110079ea`
+`mov edx, [0x1280437c]`, `0x110079f0` `mov eax, [ebx + 0xc]`, `0x110079f3` `mov ecx, [edx + 0xc]`; `0x11007a10`
+pushes `0x11fd1928` (`'Pause_%d'`, whose other reference is `0x11169c43`), `0x11007a2c` `lea edi, [eax + 0xc]`,
+`0x11007a53`-`0x11007a5a` read `[esp + 0x20]` -> `[edx + 4]` -> `[eax + 0xd0]`, `0x11007a60` reads
+`[0x12804a50]`, `0x11007a6b` `call 0x116504b0`, `0x11007a9d` `mov ecx, [eax + 0xc]`. `0x110079e0` and `0x11007a00`
+are mid-function addresses with zero verified xrefs, not helper entry points. probe175 keeps the conclusion that
+`0x11fb5040`, `0x11fb5044`, `0x11fb5048`, `0x11fb504c` have no verified xrefs and no disp32 sites, so the earlier
+mode-table sizing claim was wrong.
+
+CORRECTED (2026-11-07, probe-level probes `local/scratch/p210*.py`-`p227*.py`): the paragraph that used to sit
+here — "`[0x12162b40]` is initialised by `0x1137f6c0`, which also writes `[0x12162b40] = 0x11f1071c`,
+`[0x1285c450] = 0x11f1074c`, `[0x1285c448] = 0x10413200`, `[0x1285c444] = 0x11f10798`, `or [0x1285c44c], 1`,
+`call 0x11788030`" — is **unsupported** and is superseded. `0x12162b40`, `0x1285c448`, `0x1285c44c`, `0x1285c450`
+and `0x1285c454` have ZERO `.reloc` patch sites (`0x1285c444` has 2); `0x11f1071c`, `0x11f1074c`, `0x11f10798`
+and `0x10413200` are the stored value at no patch site at all; and `0x1285c444`-`0x1285c454` have no file offset
+(`.data` = VA `0x12093000`, virtual size `0x8051e0`, raw size only `0xe7c00`, so that range is zero-initialised
+BSS). What `0x1137f6c0` actually does is a one-time guard init: stores `[0x1280493c] = 0x11f921e8`,
+`[0x1280d49c] = 0x11f1687c`, `[0x1280d4a0] = 0x11f16894`, `[0x1282e598] = 0x11f168a8` (plus `[0x1282e594]`), and
+calls `0x116c1bb0`, `0x1003b4b0`, `0x106f9ff0`. Related accessors: `0x111854b0` = `mov eax, [0x12189644]` / `ret 4`,
+`0x11340c90` = `mov eax, [0x1217bc8c]; push 1; push eax; call 0x10c569d0`, `0x11185510` = `mov eax, [0x1280443c]`
+then `jmp 0x10f0c4c0`.
+
+`probe172.py` found the same id by raw disp32 byte hits (`0x10f0c770`, `0x10f4c400`, `0x10f92420`, `0x10fa1710`,
+`0x11279910` twice, `0x1133fb80`, `0x113403e0` three times, `0x11a7f820`); probe188 confirms 11 verified xrefs,
+whose instruction addresses are `0x10f0c7ec`, `0x10f4cb11`, `0x10f9260e`, `0x10fa1aa5`, `0x11279965`, `0x11279ae5`,
+`0x1133fb8a`, `0x113405ab` plus the data cells `0x1216a00c`, `0x1216aa40`, `0x1216aee4`, `0x12173ff4` inside the
+`0x11bcac20` blob.
+
+### Global reference census from `.reloc` patch sites (2026-11-07, `local/scratch/p199*.py`-`p227*.py`, `scripts/fc3_reloc_xref.py`)
+
+Method (the only reliable way to enumerate a global's references in this binary): FC3.dll has **772159** `.reloc`
+entries; every HIGHLOW entry is a patch site whose stored dword is the address used in some disp32 operand, so
+"patch sites whose stored dword == G" is the complete reference list of global G. A global that no instruction
+ touches has zero patch sites. Every site for the globals below is inside `.text`, and the aligned-instruction
+operand scan reproduces the patch-site count exactly (`0x12804acc` 4614 = 4614, `0x12804ac0` 1129 = 1129,
+`0x12804a50` 186 = 186, `0x1280437c` 1776 = 1776, `0x1217bc8c` 7 = 7, `0x12162beb` 14218, `0x128042fc` 14905).
+
+Write sites (destination operand), read straight out of the dumps:
+
+| global | write sites | what the write does |
+|---|---|---|
+| `[0x1280437c]` | `0x11757eda` `mov [0x1280437c], ebx`; `0x1175b58b` `mov [0x1280437c], eax` | `ebx` is the null value used by the teardown routine `0x11757b80`; `0x1175b58b` (inside the routine starting at `0x1175a7e0`) is the only installing write found so far |
+| `[0x12804acc]` | `0x10048100` `mov [0x12804acc], 0` (deleting dtor `0x100480f0`); `0x117567ce` `mov [0x12804acc], esi`; `0x11756f37` `mov [0x12804acc], ebx` | 3 writes out of 4614 sites; the other 4611 are reads |
+| `[0x12804ac0]` | `0x11629dd6` `mov [0x12804ac0], ebx`; `0x1162a703` `mov [0x12804ac0], eax`; `0x1162a70a` `mov [0x12804ac0], ebx` | 3 writes out of 1129 sites |
+| `[0x12804a50]` | `0x100bf8b7` and `0x100bf8c7` (`mov [0x12804a50], eax`, inside the routine starting at `0x100bf830`); `0x116e7f96` `mov [0x12804a50], 0` (inside `0x116e7f70`) | the object is created by `0x100bf830` and released by `0x116e7f70`; the rest of the 186 sites are reads |
+| `[0x1217bc8c]` | `0x106ed8ba` `mov [0x1217bc8c], ebx` (clear, inside `0x106ed890`) and `0x106efaa8` `mov [0x1217bc8c], 0x106b71b0` (inside `0x106ef800`) | 2 writes out of 7 sites; readers `0x11340c90`, `0x11342740`, `0x112e319b`, `0x112e31b2` |
+| `[0x128042fc]` | `0x11789a45` `mov byte ptr [0x128042fc], al` | the only store; the other 14904 sites are `cmp byte ptr [0x128042fc], bl`-style reads |
+
+Teardown routine `0x11757b80` (VERIFIED, `local/scratch/p200_out.txt`, `p207_out.txt`): for each of
+`[0x127bc324]`, `[0x12804384]`, `[0x1280437c]`, `[0x1280440c]`, `[0x12804430]`, `[0x128043b4]`, `[0x128042e4]`, …
+it runs `mov ecx, [g]` / `cmp ecx, ebx` / `je skip` / `mov edx, [ecx]` / `mov eax, [edx]` / `push 1` / `call eax`
+(COM-style `Release(1)` through slot 0) and then `mov [g], ebx`. So a global being zeroed there is being released,
+not merely cleared.
+
+`0x1174c070` is the container's keyed-lookup helper (VERIFIED, `local/scratch/p213_out.txt`): `mov eax, [ebp+8]`
+-> `mov eax, [eax+0xc]` -> `test eax, eax; je 0x1174c120` (count 0 -> not found), then `mov edx, [ecx+8]` (item
+array), `mov ecx, [edx+edi*4]`, `mov eax, [ecx]`, `mov eax, [eax+0x10]`, `lea edx, [esp+0x10]`, `push edx`,
+`call eax` (vtable slot 4 of the item), then `mov eax, [eax]`, `mov ecx, [eax]`, `mov eax, [eax+4]`,
+`cmp ecx, [ebp+0xc]`, `cmp eax, [ebp+0x10]`, and `bl` = found/not-found. Container layout therefore:
+`+8` = item array, `+0xc` = count.
+
+`0x1174c070` is reached from 299 of the `[0x1280437c]` sites; the other frequent call targets after a container
+load are `0x116f56a0` (97), `0x1013c1f0` (84), `0x1174b660` (77), `0x116eda40` (66), `0x100945e0` (45),
+`0x1024be80` (45), `0x1174c1b0` (40), `0x11788030` (38), `0x116f0a40` (36) — 425 distinct targets in total
+(`local/scratch/p218_out.txt`). There is no `mov ecx, [0x1280437c]` + `call` pattern anywhere (probe222), so the
+container is always handed to a helper as an argument, never used as `this`.
+
+Registry-writer family (probe226/probe227, `local/scratch/p227_out.txt`): writing `[0x1217bc8c]`,
+`[0x12804acc]`, `[0x12804ac0]`, `[0x12804a50]` and `[0x1280437c]` within one instruction window happens at
+exactly two places — `0x11002390` and `0x118586d0` — and both are `0x116eda40 push ecx / push ebx / call
+0x1101a150`, i.e. three arguments, not five. Those five globals therefore belong to the registry class itself,
+not to a parameter list, and each write is one field of that class. `0x118586d0` is inside the routine starting
+at `0x118580f0`, and `0x11002390` is a jump-target (predecessors `0x11002041`, `0x110021f2`) inside the routine
+starting at `0x11002000`.
+
+No store to `[reg + 0xc]` occurs within 0x80 bytes of any `[0x1280437c]` load (probe216/probe217): the count field
+is still not attributed to a writer. Lessons: a linear whole-`.text` disassembly desynchronises and invents
+`add reg, imm` / `or reg, imm` forms whose disp32 field is really the global (this is where the old
+"2400+ writes" figure came from); per-function overlap estimates inflate counts (1027 windows -> 1765 stores for
+a 1776-site global); capstone's `detail.canonical` raises `AttributeError` on some instructions (use
+`i.op_str`); `xlib.enclosing(starts, va)` takes the starts list first.
+
+Two corrections to this section:
+
+- the pause-menu function spans `0x11007920`-`0x11007c66` (`ret` at `0x11007c66`, `0xCC` padding up to
+  `0x11007c6f`, next function at `0x11007c70`), not `0x11007c70`;
+- `0x11185b9a` is `call 0x11789a00`, not a count read, and `0x11007a9d` reads `[eax + 0xc]` where `eax` comes from
+  the `[esp + 0x20]` -> `[edx + 4]` -> `[eax + 0xd0]` chain, not from the container. The only count reads proven
+  from the container are `0x110079f3` (`mov ecx, [edx + 0xc]` with `edx = [0x1280437c]`) and `0x1174c070`
+  (`mov eax, [eax + 0xc]` with `eax` = the container argument).
+
+- Open objectives: identify the
+  class whose vftable is `0x11fc6268` (the neighbouring strings name `CFCXGOBuilderCommon`, so the holder is a
+  `CFCXGOBuilder*` class) and what its eight slots mean; who writes the count field `[[0x1280437c]+0xc]` (its
+  proven reads are only `0x110079f3` and `0x1174c070`); who calls the installing write `0x1175b58b` (the routine
+  `0x1175a7e0` is not yet attributed); the owner of the container receiving the manager at `0x111f4fc6`; what
+  `0x106eac80` and `0x106e96c0` do; the coop entry among the thirteen registry rows.
+  Closed in this session: `[0x128042fc]` (`0x11789a00` at `0x1119a53e`), `0x118db560` (the
+  allocation helper), `[0x121a7eb0]`-`[0x121a7eb8]` + `[0x120931c8]`, `[0x1217bc8c]` readers,
+  `[0x12807738]`/`[0x12807740]`/`[0x12807744]` readers (`0x111f4fde`, `0x111f4ff2`, `0x111f500d`),
+  the write sites of `[0x12804acc]`, `[0x12804ac0]`, `[0x12804a50]`, `[0x1217bc8c]` and `[0x1280437c]`, and the
+  claim that `0x1137f6c0` initialises `[0x12162b40]` (disproved).
+  Bilingual NOTES + commit for every new finding.
+
+### Store-writer attribution and verified call edges from the aligned `.reloc` census (2026-11-07, `local/scratch/p265.py`-`p270.py`)
+
+Two census-data facts change how the table above must be read (both were wrong in earlier probes):
+
+- `local/scratch/census199.json` is keyed by **decimal** address strings (`'310395644'` = `0x128042fc`); a lookup with
+  `hex(g)` silently returns nothing, which produced a run reporting `refs=0 stores=0` for all 13 globals. Each entry is
+  `[site_va, mnemonic, op_str, flag]` and `flag` is **not** a store marker (`cmp` sites carry `True`). A site is a store
+  only when the mnemonic writes *and* the memory operand is the first operand.
+- a `census199` `site_va` is the **reloc patch field**, not the instruction start: for direct disp32 forms it sits +2
+  past the opcode (`80 3D disp32 imm8`, `89 0D disp32`). `census196.json`/`census197.json` hold the instruction-start
+  variant (`cmp byte ptr [0x128042fc], bl` = instruction `0x1004823A` vs patch site `0x1004823C`). `p268.py` realigns by
+  disassembling from `site-16` and keeping the instruction that covers the site. This corrects two addresses in the
+  table above: the `[0x12804acc]` clear is `0x10048100` (not `0x10048102`) and the `[0x1217bc8c]` clear is `0x106ed8ba`
+  (not `0x106ed8bb`).
+
+Complete store table (`p268_out.txt`; refs = patch sites, insn = aligned instruction start):
+
+| global | refs | stores | store insn | enclosing function | prologue of the enclosing function |
+|---|---|---|---|---|---|
+| `[0x12162beb]` | 14218 | 1 | `0x1177584a mov [0x12162beb], cl` | `0x11775800` | `push ebp; sub esp,0x24; push 1; push 0x2000; push 0x10000000; push 0` |
+| `[0x1217bc8c]` | 7 | 2 | `0x106ed8ba mov [0x1217bc8c], ebx` | `0x106ed890` | `mov eax,[0x1217bcf4]; mov ecx,[eax]; mov edx,[ecx]; mov eax,[edx+0x30]; push 0x11e6c31c; call eax` |
+| | | | `0x106efaa8 mov [0x1217bc8c], 0x106b71b0` | `0x106ef800` | `mov esi,ecx; lea eax,[esi+8]; mov [0x1217bc84], eax` |
+| `[0x128042fc]` | 14905 | 1 | `0x11789a45 mov [0x128042fc], al` | `0x11789a00` | `cmp byte ptr [0x128042fc], 0; jne 0x11789b63; mov eax,[0x1217bc8c]` |
+| `[0x1280437c]` | 1776 | 2 | `0x11757eda mov [0x1280437c], ebx` | `0x11757b80` (teardown; starts by reading `[0x12804ac8]`, `[eax+0x58]`, `movsd xmm0,[eax+0x48]`) |
+| | | | `0x1175b58b mov [0x1280437c], eax` | `0x1175a7e0` | `and esp,0xfffffff8; sub esp,0x9c; mov esi,[ebp+8]; mov edi,[ebp+0xc]` |
+| `[0x12804a50]` | 186 | 3 | `0x100bf8b7` and `0x100bf8c7` `mov [0x12804a50], eax` | `0x100bf830` | `cmp byte ptr [0x128042fc], bl; jne 0x100bf849` |
+| | | | `0x116e7f96 mov [0x12804a50], 0` | `0x116e7f70` | `mov edi,ecx; call 0x116e7ec0; mov eax,[0x12804a50]; push eax; call 0x1164ff40` |
+| `[0x12804ac0]` | 1129 | 3 | `0x11629dd6 mov [0x11629ac0], ebx` | `0x11629c30` | `mov ecx,[0x12804b70]; cmp ecx,ebx; je; mov eax,[ecx]; mov edx,[eax]; push 1; call edx` |
+| | | | `0x1162a703` / `0x1162a70a` | `0x1162a530` | `mov esi,[ebp+8]; mov edi,[ebp+0xc]; add esi,4` |
+| `[0x12804acc]` | 4614 | 3 | `0x10048100 mov [0x12804acc], 0` | `0x100480f0` (deleting dtor: `mov esi,ecx; mov [esi],0x11f169dc; test byte ptr [ebp+8],1; ret 4`) |
+| | | | `0x117567ce mov [0x12804acc], esi` | `0x11756650` | `mov ebx,[ebp+8]; mov esi,[edi+0x68]; cmp byte ptr [edi+0x6c],0` |
+| | | | `0x11756f37 mov [0x12804acc], ebx` | `0x11756c50` | `mov edi,[ebp+0x14]; cmp edi,-1` |
+| `[0x12807738]`/`[0x12807740]`/`[0x12807744]` | 13 / 5 / 2 | 1 each | `0x11b2a613`, `0x11b2a61d`, `0x11b2a622` | `0x11b2a610` | `or eax,0xffffffff; mov [0x12807738],eax; mov [0x1280773c],eax; ... mov [0x1280775c],eax; ret` |
+| `[0x12891ca0]`/`[0x12891ca8]` | 1 each | 1 each | `0x1127995f`, `0x11279adf` `mov [...], 0x43521e6f` | `0x11279910` | `sub esp,0x1d0; mov ebx,[ebp+8]; lea eax,[ebx+0x238]` |
+| `[0x12891ca4]`/`0x12891cac]` | 2 each | 1 each | `0x11279959` / `0x11279ad9` `or dword ptr [...], eax` | `0x11279910` | as above |
+
+What each of these says:
+
+- **`[0x12162beb]` is settled.** Its only store is `0x1177584a` inside `0x11775800`, which (1) calls
+  `[0x11bcb130](0, 0x2000, 0x10000000, 1)`, (2) stores the returned region base into `[0x121bbff8]`, (3) stores the
+  rounded size (`add eax, 0xfffffff`) into `[0x121a7fdc]`, (4) calls `[0x11bcb144](buffer[ebp-0x24])`, (5) sets
+  `cl = ((0x10000 / [ebp-0x20]) * [ebp-0x20]) == 0x10000` (`div` then `imul` then `cmp`) and stores `cl`. So this byte is
+  a **memory-quantum feature flag** (the region is 256 MiB, granularity 8 MiB), not a co-op switch. The only verified
+  call of `0x11775800` in the recorded call graph is `0x1177f70e` inside `0x1177f700` (raw bytes there are
+  `push esi; mov esi,ecx; call 0x106c2c50; call 0x11775800; call 0x1177eac0`). `[0x121bbff8]`/`[0x121a7fdc]` are the
+  arena bounds the deleting dtor `0x100480f0` tests before freeing through `0x1177f5b0`.
+- **`[0x128042fc]` is an allocator-initialised guard, not a mode gate**: 14905 reads and **14903 recorded calls of
+  `0x11789a00`** — the same lazy-init idiom repeated across the module (`cmp byte ptr [0x128042fc], bl; jne skip; call
+  0x11789a00`), verified at `0x10002c02`, `0x10002c89`, `0x10002f72`, `0x10003001`. That is why the global looks like a
+  gate by reference count alone.
+- **`[0x12804a50]` has a teardown**: `0x116e7f70` releases the object with the COM-style `Release(1)` shape
+  (`mov eax,[0x12804a50]; push eax; call 0x1164ff40`, then `mov ecx,[0x12804a50]; mov edx,[ecx]; mov eax,[edx]; push 1;
+  call eax`) and stores 0 at `0x116e7f96`. Combined with `0x100bf830` (which first checks `[0x128042fc]` before creating
+  the object), the global is a lazily created/released singleton.
+- **`[0x12804acc]` clear belongs to the deleting dtor** `0x100480f0`: it restores the vtable
+  (`mov dword ptr [esi], 0x11f169dc`), clears the global, and frees `esi` through `0x1177f5b0` only when the pointer lies
+  in the arena `[0x121bbff8] .. [0x121a7fdc]`.
+- **`[0x12804ac0]` clear is inside a teardown** `0x11629c30`, which first runs the same `Release(1)` idiom on
+  `[0x12804b70]` before clearing `[0x12804ac0]` at `0x11629dd6`.
+- **`[0x1217bc8c]` write sites are both inside their routines**: cleared at `0x106ed8ba` inside `0x106ed890` (which opens
+  with a virtual call through slot `+0x30` with the string argument `0x11e6c31c`), and installed at `0x106efaa8` inside
+  `0x106ef800` with the static object `0x106b71b0`; the same routine stores `0x106b71e0` into `[0x1217bc88]` and the
+  holder's own fields into `[0x1217bc84]`.
+- **The mode/session id block has a reset routine**: `0x11b2a610` is `or eax, 0xffffffff` followed by stores of `-1` into
+  `[0x12807738] [0x1280773c] [0x12807740] [0x12807744] [0x12807748] [0x1280774c] [0x12807750] [0x12807754] [0x12807758]
+  [0x1280775c]`. It has **no direct `call`/`jmp` edge in the recorded call graph** (reached through a pointer), which is
+  the answer to "who writes the mode-id globals": they are reset to `-1`, and the only installs of a real value found so
+  far are the manager-constructor reads at `0x111f4fde`/`0x111f4ff2`/`0x111f500d`.
+- **The coop id `0x43521e6f` is installed lazily at runtime**, not only baked in the data table: `0x11279910` writes it
+  into `[0x12891ca0]` at `0x1127995f` and into `[0x12891ca8]` at `0x11279adf`, each preceded by an
+  `or dword ptr [0x12891ca4], eax` / `or dword ptr [0x12891cac], eax` init stamp. `0x11279910` has exactly two recorded
+  call sites (`0x11279fd2`, `0x1127a16f`) and it calls `0x113224e0` twice (`0x11279982`, `0x11279b02`).
+- **`0x113224e0` is a registry lookup by type id**: it builds a local object with vtable `0x11f94dd4`, then walks the
+  accessor array `[ecx+4] .. [ecx+8]` (stride 4, with `lea edx,[eax+edx*4]`) of the singleton at `[0x128048c0]`, comparing
+  `dword ptr [item + 0x20]` against an id obtained through a virtual call at slot `[obj]+0x58`. Its only two callers are
+  the two sites inside `0x11279910`, so the coop-id installing routine asks the registry for an entry.
+
+Call-graph discipline learned in this pass: `local/scratch/calls.json` contains **mis-aligned entries**. It lists
+`0x11789b42` as a caller of `0x11775800`, but decoding from the verified start `0x11789b28` gives `0x11789b42 call
+0x11768700` instead; and a `ret` at `0x11279a53` sits between the two `0x113224e0` calls, so `0x11279910` is not one
+straight line. Every claimed edge must be re-read from raw bytes at a verified function start before it is published.
+
+New open questions: what calls `0x11279910` (and therefore what triggers the coop-id install); who reaches `0x11b2a610`
+and `0x116e7f70` (no recorded edges — they are pointer-reached); which registry entry `0x113224e0` resolves for the coop
+id; and whether the arena globals `[0x121bbff8]`/`[0x121a7fdc]` are the same region that `0x1101a150` and
+`0x1101a1b0` allocate through `[0x11bcb130]` with `0x10000`/`0x20000` sizes.
+
+## Co-op-id install path, verified from raw bytes (2026-11-07, agent session, `local/scratch/p271*.py`..`p282*.py`)
+
+Continuation of the 2026-11-07 store-writer pass, answering the four open questions from
+"Store-writer attribution and verified call edges". Every claim below is read from raw FC3.dll bytes
+at a verified function start; `local/scratch/calls.json` is still treated as unreliable (see the
+withdrawn chain at the end).
+
+- **The co-op id `0x43521e6f` is installed at RUNTIME, it is not a static global value.** The global
+  `[0x12891ca0]` lies in `.data` past the raw file size (virtual start `0x12093000`, raw size
+  `0xe7c00` → BSS-like, image initial value 0). `0x11279910` writes it: `mov dword ptr [0x12891ca0],
+  0x43521e6f` at `0x1127995f`, guarded by `test byte ptr [0x12891ca4], al` / `jne 0x11279969`
+  (`0x11279951`/`0x11279957`) and an `or dword ptr [0x12891ca4], eax` init stamp (`0x11279959`).
+  A sibling global `[0x12891ca8]` gets the same id at `0x11279adf`. (probe p278, p280)
+- **Where `0x43521e6f` does appear as a literal:** the mode-id table entries `.data 0x1216a00c`,
+  `0x1216aa40`, `0x1216aee4`, `0x12173ff4` (already recorded), plus `.text` sites `0x10f0c7ec`,
+  `0x10f4cb11`, `0x10f9260e`, `0x10fa1aa5`, `0x1133fb8a`, `0x113405ab`, `0x1134062a`, `0x11340a2d`,
+  `0x11a7fa12`. (probe p278)
+- **`0x11279910` is a helper called twice by one bigger routine, not a top-level trigger.** Its only
+  two `call` sites are `0x11279fd2` (inside `0x11279fc0`) and `0x1127a16f` (inside `0x1127a0f0`); a
+  linear decode shows the routine runs `0x11279910..0x1127ad0e` and is split by `ret` at `0x11279a8a`
+  and `0x11279c0a`. The caller `0x11279fc0` has no direct caller; `0x1127a0f0` is called from
+  `0x11a5870b` inside function `0x11a58700`. (probe p273, p276, p280)
+- **The real trigger is a virtual dispatch.** `0x11a58700` has no direct `call`; the value is a
+  pointer stored at `.rdata 0x1200ad14`, a slot in a dispatch table spanning `0x1200ad00..0x1200ad2c`
+  whose neighbours `0x11277c20`, `0x11278160`, `0x11279700` are the same `0x1127xxxx` family as
+  `0x11279910`. So the co-op-id install fires through a vmethod on that table's object. (probe p281, p282)
+- **`0x11b2a610` (mode-id reset to `-1`) is a vmethod of an object whose vtable is never stored
+  statically.** It is slot `+0x2b8` of a 200-entry table `0x11bd2b04..0x11bd2e24` (a
+  `0x11b29040..0x11b2a9c0`, step-`0x20` accessor table). The base `0x11bd2b04` appears NOWHERE in the
+  image — not as a code reference and not even as a stored pointer — so its vtable pointer is installed
+  on a live object at runtime. The global `[0x121e5a38]` currently reads the guard value `0xc9700a6a`,
+  **not** a vtable, so it is not the co-op manager pointer as the previous session assumed. (probe p271, p272, p274)
+- **`0x116e7f70` (the `Release(1)` teardown of `[0x12804a50]`) is slot `+0xc` of a 19-entry vtable
+  `0x11f26488..0x11f264d4`.** That vtable base IS installed in code: `mov dword ptr [ebx], 0x11f26488`
+  at `0x116e8127` (constructor `0x116e7fb0`) and `mov dword ptr [edi], 0x11f26488` at `0x116e82ea`
+  (constructor `0x116e82e0`, called from `0x1174676c`). So `[0x12804a50]` is an object of the
+  `0x11f26488` class and `0x116e7f70` runs when it is destroyed. (probe p272, p273)
+- **Withdrawn chain.** The previous session's "`0x11279910` → `0x11554c40` → `0x11554b70`" edge does
+  not survive decoding: from a verified start, `0x11554b70` lands mid-instruction and yields garbage
+  (`add al,0xdb; inc eax; ...`), so that chain is **not confirmed** and is retracted.
+
+New open questions: what object owns the `.rdata 0x1200ad00` dispatch table and who calls into
+`0x11a58700`; which live object carries vtable `0x11bd2b04` (the mode-id-reset owner) — this needs a
+constructor that writes that vtable or a runtime/heap dump, since it is never stored statically; and
+whether `[0x121e5a38] = 0xc9700a6a` is a heap canary rather than a manager pointer.
+
+## The dispatch table `0x1200ad00` is owned by `CFCXPlaylistService` (2026-11-07, agent, `local/scratch/p283*.py`)
+
+Answers "what object owns the `.rdata 0x1200ad00` dispatch table and who calls vmethod `0x11a58700`"
+from the previous section. FC3.dll has **no MSVC RTTI** (the `-0x4` slot is 0; the only `.?AV` strings
+in the file are Havok serialization). FC3 uses a **custom RTTI: vtable slot `+0x04` is a class-info
+getter** that does `push <name_string>; call <getname>`. Chain (verified from raw bytes):
+
+- `IGameModeService` (base vtable `0x11f169e8`, getter `0x10048190`) → `CPlaylistService`
+  (vtable `0x11fab790`, getter `0x10362330`, name string `0x11f8d98c`, descriptor `.data 0x1285e0ec`)
+  → **`CFCXPlaylistService`** (the owner of the target vtable; name string `0x11fc544c`, pushed at
+  `0x103d1659`, descriptor `.data 0x12863890`, getter `0x103d1640`).
+- **Target vtable bounds:** `.rdata 0x1200ad00..0x1200ad50`, exactly 21 slots (`+0x00..+0x50`), bounded
+  by zero dwords at `0x1200acfc` and `0x1200ad54`. Slot `+0x48` returns the playlist-name strings
+  `"UserPlaylist"` (`0x1127a2b1`), `"OfflinePlaylist"` (`0x1127a2cf`), `"PrivateCoopPlaylist"`
+  (`0x1127a2e6`), `"MapArchivePlaylist"` (`0x1127a2fd`), `"BetaTestPlaylist"` (`0x1127a314`) — so the
+  co-op-id install routine `0x11279910` (a callee of this class's slots `0x11277c20`/`0x11278160`/
+  `0x11279700`) is reached from the **playlist service** object, i.e. picking the *PrivateCoopPlaylist*
+  (or similar) is what drives the co-op-id install.
+- **Constructor `0x11a585a0`** installs the vtable: `mov dword ptr [esi], 0x1200ad00` at `0x11a585b3`
+  (then child vtables at `[esi+0x50]=0x1200ad58`, `+0x54=0x1200ad9c`, `+0x58=0x1200ada8`,
+  `+0x60=0x1200ae10`, and `[esi+0x8c8]=0x11fbcc20`). Base ctor `0x11278470` first writes
+  `0x11f169e8`, then at `0x11278526` `mov [ebx], 0x11fab790`. Destructor `0x11a58440` re-stores
+  `0x1200ad00` at `0x11a5845f` (standard MSVC dtor behaviour).
+- **Factory `0x11a58670`**: `mov eax,0x10; mov edi,0x900; call 0x118db560` → **class size 0x900**, then
+  `call 0x11a585a0`. Only creation path is a **class-registry registration**: `push 0x11a58670` at
+  `.text 0x111a0541` inside `0x1119fa50`, immediately after `call 0x103d1640` (the class-info getter)
+  and `call 0x118ce980` (register into the global registry `[0x12804b1c]`).
+- **No global holds an instance:** the value `0x1200ad00` appears exactly twice in the whole file, both
+  as imm32 in `.text` (`0x11a585b5` ctor, `0x11a5845f` dtor). The instance lives on the heap; the
+  pointer is held by the (BSS, runtime-initialized) class registry `[0x12804b1c]`.
+- **Who calls vmethod `0x11a58700` — not resolvable statically, with proof why.** It is slot 5
+  (`+0x14`), an override (the base table `0x11fab790+0x14` holds `0x10362e70`). Its body:
+  `mov esi,ecx; call 0x1127a0f0; push esi; call 0x103fe6c0; mov [esi+0x8cc],eax` and links node
+  `[esi+0x8c8]` into the list at `[eax+0xe8]` (an "attach"); the sibling slot `+0x18` (`0x11a58380`)
+  detaches via `0x1115e4a0`. The classic `call dword ptr [ecx+0x14]` encoding (`FF 51 14`) does **not
+  exist** in this DLL (0 matches); every `call [reg+0x14]` form in `.text` goes through stack slots
+  (`ebp`/`ebx`/`esp` functors, 245 sites, none a vtable). Real virtual dispatch in this build is the
+  pair `mov reg,[obj+0x14]; call reg` — 3073 such pairs, not attributable to a type without a runtime
+  type map. **Next probe is dynamic:** breakpoint the factory `0x11a58670` (or the registry write
+  `0x118ce980`), dump `[instance]`, and trace returns of the slot `+0x14` call on a live process.
+
+## `0x11bd2b04` is NOT a vtable — it is a function-pointer init table; the mode-id globals' real writer (2026-11-07, agent, `local/scratch/p285*.py`..`p287*.py`)
+
+Answers "which live object carries vtable `0x11bd2b04` (the mode-id-reset owner)" from the
+co-op-id section. A researcher run timed out at the 30-min watchdog; the result was reconstructed
+from raw bytes with probes p285–p287. Correction to the 2026-11-07 store-writer note:
+
+- **`0x11bd2b04` is not a class vtable.** It is a ~200-entry array of *tiny independent stub
+  functions* in `.rdata` (`0x11bd2b04..0x11bd2e24`, slots `0x11b29040..0x11b2a9c0`), not a class's
+  method table. Proof: (1) the base dword `0x11bd2b04` appears **0 times** anywhere in the file
+  (no code ref, no stored pointer) — a vtable always has at least its constructor's `mov [this],
+  <vtable>` imm32 (contrast the real `CFCXPlaylistService` vtable `0x1200ad00`, which has exactly
+  two such stores); (2) the entries are not methods — e.g. `+0x00` (`0x11b29040`) is
+  `call 0x10024dc0; push 0x11ba38f0; call 0x106f9c37; ret`, `+0x04` (`0x11b29060`) clears globals
+  `[0x12806178]`/`[0x12806184]` — none reads a `this`/`ecx` object. It is reached by a PE data
+  directory / CRT static-init mechanism, not by an object pointer.
+- **The reset routine `0x11b2a610` (table entry at `+0x2b8`, file `.rdata 0x11bd2dbc`) is a bare
+  initializer**, not a method: `or eax, 0xffffffff; mov [0x12807738], eax; ... mov [0x1280775c], eax; ret`
+  (ten dwords `0x12807738, 3c, 40, 44, 48, 4c, 50, 54, 58, 5c` set to `-1`). No argument, no side
+  effects → it runs once at module init to prime the array to `-1`.
+- **The only runtime writer of those ten globals is `0x117884f0`** (structural `.text` scan: 70
+  accesses of the block, exactly 5 stores, all in this one function). It is called from a single
+  `e8` site `0x10c56ee8`, inside a routine that allocates with `0x118db560` and stores the created
+  object into the global `[0x12805e24]`. `0x117884f0` reads a packed 16-bit field `[0x1217c688]`
+  (BSS default `4`), spreads its bits into the ten slots via per-bit loops, and writes them through
+  helper `0x10037bc0(global_va, &value, index)`; it also uses a count
+  `[0x1217af10]-[0x1217b2fc]` (BSS defaults `83`/`0x7FC9xxxx`). The other five globals
+  (`0x12807738/3c/40/44/5c`) have **no writer at all** besides the init stub `0x11b2a610`.
+- **Consequence for the "mode/session id" label:** the prior note called `[0x12807738..0x1280775c]`
+  the "mode/session id block". This pass shows the block is a fixed 10-dword array primed to `-1`
+  and recomputed at runtime from a packed feature/resolution bitfield — the co-op-id install path
+  (`0x11279910` → `[0x12891ca0/0x12891ca8]`) is a *different* set of globals. Whether these ten
+  dwords are session ids or a video/mode capability table needs a separate probe of `[0x1217c688]`;
+  flagged, not resolved. (The 2026-11-06 manager-ctor reads `0x111f4fde/0x111f4ff2/0x111f500d` of
+  `[0x12807738]/[0x12807740]/[0x12807744]` remain valid — readers exist, the writer is `0x117884f0`.)
+
+Open: (a) caller of vmethod `0x11a58700` — still unresolved, dynamic trace needed (see prior
+section); (b) identify `[0x1217c688]` and the meaning of the `[0x12807738..0x1280775c]` array;
+(c) what triggers the init table `0x11bd2b04` (CRT `__initterm` walker / engine DllMain slot
+`[0x11e6c3dc]`).
+
+## FC3.dll is ASLR-enabled — every hardcoded address must become base+RVA (2026-11-07, agent, `pefile` on the TestFC3 copy)
+
+Critical for the mod build (hooks H1/H2). `pefile` on `H:\FarCryCoop\TestFC3\bin\FC3.dll`:
+- `machine=0x14C` (x86), `ImageBase=0x10000000`, `DllCharacteristics=0x0140` → bit `0x40` (DYNAMIC_BASE)
+  **is set**, and the base-relocation data directory is **present**. So the DLL *will* relocate at
+  runtime when 0x10000000 is taken — all the addresses in this file are VA-at-preferred-base only.
+- Consequence: the ASI/loader must obtain the live FC3.dll module base (`GetModuleHandle("FC3.dll")`)
+  and add RVAs, never hardcode `0x12891ca0` etc. RVAs (VA − 0x10000000) already needed:
+  `[0x12891ca0]→0x2891ca0`, `[0x12891ca8]→0x2891ca8`, `[0x12807738..0x1280775c]→0x2807738..`,
+  vtable `0x1200ad00→0x200ad00`, init table `0x11bd2b04→0x1bd2b04`, install routine
+  `0x11279910→0x1279910`, `CFCXPlaylistService` method `0x11a58700→0x1a58700`.
+- `Subsystem=2` (GUI). The working copy is confirmed 1.06 (`FC3.dll` 40,720,424 bytes, 2026-11-01).
+
+## Co-op installer call chain + Playlist service plumbing (session 4, static probes p290–p295)
+
+Probes `local/scratch/p29{0..5}_*.py` (+ `.out`) on `H:\FarCryCoop\TestFC3\bin\FC3.dll`. A researcher
+delegate was tasked to resolve the last dispatch link of the co-op installer; it timed out at the 30m
+wall-clock (SIGTERM) but its probe scripts completed. Findings:
+
+- **The co-op installer `0x11279910` has exactly two direct static callers**, both methods of the
+  playlist-service object (the `this` is held in `edi`/`esi` and members `[+0x8c0]`,`[+0x8c4]` are
+  written around the call):
+  - `0x1127a16f` inside routine `0x1127a0f0` (the base slot `+0x14` impl; `call 0x11279a90` then
+    `call 0x11279910` back-to-back, then sets members `[+0x488]=2`, `[+0x4b0]=0x32`, `[+0x4b4]=0xa`,
+    `[+0x4b8]=5`). `0x1127a0f0` is the routine that actually drives the co-op id install.
+  - `0x11279fc0` (child vtable `0x1200ad9c` slot 0 → co-op installer).
+- **`0x11a58700` is NOT the installer's caller** — re-confirmed. It is the `CFCXPlaylistService
+  not initialized` error path (see prior note); its only role in the chain is being slot 2 of vtable
+  `0x1200ad00`. The earlier `0x11a58700 → 0x1127a0f0` framing is superseded: the *real* per-tick
+  driver is the slot `+0x14` method `0x1127a0f0` on the playlist service, dispatched generically.
+- **Who creates the service**: registration routine `0x111a04f0`… calls getter `0x103d1640`
+  (singleton guard `[0x1286388c]`, instance global `0x12863890`) and registers slot handlers via
+  `0x118ce980` (pushes handler `0x11a58670` then `call 0x118ce980`), plus a create/lookup
+  `0x11756a50` on service container `[0x12804acc]`. Handler `0x11a58670` sits next to the
+  `not initialized` error path `0x11a58700` (same object, slot 0x14 region).
+- **Playlist service registry names** (`.rdata`, `NetObject.PlaylistService` family):
+  `CPlaylist`@`0x11fab6a4`, `CPlaylists`@`0x11fab6b0`, `CPlaylistServiceMemento`@`0x11fab6bc`,
+  `NetObject.PlaylistService`@`0x11fab6de`, `UserPlaylist`@`0x11fab6f0`, `OfflinePlaylist`@`0x11fab700`,
+  **`PrivateCoopPlaylist`@`0x11fab710`**. `UserPlaylist`/`OfflinePlaylist`/`PrivateCoopPlaylist` are
+  referenced together at `0x1127a2b2`/`0x1127a2d0`/`0x1127a2e7` — i.e. immediately after the co-op
+  installer caller `0x1127a0f0`. **`PrivateCoopPlaylist` is the likely co-op session playlist type**;
+  flag for follow-up (what selects it, and does the co-op id `0x43521e6f` pair with it).
+- **Verdict on the last dispatch link (who invokes slot `+0x14`)**: **NOT statically resolvable in
+  reasonable time.** A generic scan (p295) for `mov r,[base+0x14]; call r` finds hundreds of sites
+  across `.text` (the idiom is the engine's generic tick dispatch), so it can't be narrowed by
+  pattern alone. Needs a runtime trace: break on `0x1127a0f0` (or the installer `0x11279910`),
+  capture the return-address stack and `this` (`edi`), which reveals the scheduler that ticks the
+  playlist service. This is the owner's (debugger) task, not a static one.
+- Net effect on the mod plan: H1 (poke the id into `[base+0x2891ca0]/[base+0x2891ca8]`) is
+  **unaffected** — we install the id after the fact, we don't need the dispatcher. `PrivateCoopPlaylist`
+  at `0x11fab710` is a new lead for the host-side session setup.
+
+## Are G1/G2 the live co-op state? H1 verdict (session 5, static probes p300–p311)
+
+Probes `local/scratch/p30{0,0b,1,2,3}_*.py`, `p310_consumers.py`, `p311_modefunc.py` (+ `.out`) on
+`H:\FarCryCoop\TestFC3\bin\FC3.dll`; cross-checked against researcher delegate `del_mw6w8qqd_bsky`
+(timed out 30m, `.out` empty, but its session thinking + probes are corroborating). This REFINES and
+partly CORRECTS the session-4 note ("H1 is unaffected"). New, decisive:
+
+- **G1=`0x12891ca0` / G2=`0x12891ca8` are NOT the live mode state.** They are function-local
+  `static const` query-key constants that MSVC promoted to `.data` (each paired with an init-guard
+  byte `0x12891ca4` / `0x12891cac`). Raw dword scan (p300/p300b): each has exactly **3 references in
+  all of `.text`, and all of them sit inside the two co-op installer routines `0x11279910` /
+  `0x11279a2b`** (sites `0x11279961/65/2b` for G1, `0x11279ae1/e5/ab` for G2). No gameplay/dispatch
+  code reads them by address. So scribbling them from an ASI **cannot switch the live game mode** —
+  it only edits the constants the installer uses as lookup keys. (Session-4 "H1 unaffected" was too
+  optimistic: H1 is not harmful, but it is also **not sufficient and tests the wrong variable**.)
+- **The co-op id `0x43521e6f` is referenced at 11 distinct `.text` sites** (p300b):
+  `0x10f0c7ec, 0x10f4cb11, 0x10f9260e, 0x10fa1aa5, 0x11279965(installer), 0x11279ae5(installer),
+  0x1133fb8a, 0x113405ab, 0x1134062a, 0x11340a2d, 0x11a7fa12`. These are the real consumers.
+- **Live current game-mode id = object field `[this + 0x4c]`.** At `0x113405a0`
+  (`mov eax,[ebx+0x4c]`) the code dispatches on the current mode by comparing it against a family of
+  **six mode-hash ids** — `0xab4fc8e2, 0x43521e6f(CO-OP), 0x9991daec, 0x6c2b3868, 0xf66ffb87,
+  0x2100ced7` — and the co-op one routes to `FCXMainMenu` + the `IngameToLobby` command
+  (`0x113405cd`..`0x11340600`). `ebx` is the mode-manager `this`. This field, not G1/G2, is the
+  switch that actually selects co-op. The six ids did **not** match plain FNV-1a of candidate mode
+  names (custom hash) — naming the siblings is a follow-up.
+- **Better "current-mode" statics than G1/G2** (delegate finding, consistent with p310):
+  `.data` slot `0x1216aee4` holds `0x43521e6f` **statically (never written from `.text`)** and is
+  read/compared ~15× as a global value (`cmp eax,[0x1216aee4]`, `mov ecx,[0x1216aee4]`); likewise
+  `0x1216ca90` holds `0x80608f71` (campaign/single-player id) read 20+×. These behave like
+  compile-time mode constants, not mutable runtime state.
+- **Real mutable state holder** (delegate, needs runtime confirmation): the live playlist/session
+  entry container at `[service + 0x8c0]` (service = the `CFCXPlaylistService` singleton, instance
+  global `0x12863890`), plus an id→mask registry global `[0x128048c0]` and the service container
+  `[0x12804acc]`. The co-op session is a `PrivateCoopPlaylist` (`0x11fab710`) entry in that container.
+
+**Net effect on the plan**: H1 (ASI poke of G1/G2) is demoted from "enables co-op" to "safe
+diagnostic that will be INCONCLUSIVE by construction" — the engine keeps `0x43521e6f` there itself,
+so writing the same value proves nothing, and the mode switch reads `[this+0x4c]`. The productive
+lead is the **live playlist-service container `[service+0x8c0]`** and the **mode-manager field
+`+0x4c`**; both need a runtime trace (owner's debugger), not an offline poke.
+
+
+## The six game-mode hashes: dispatch shape and the uncracked hash (session 6, static probes p312–p315)
+
+Probes `local/scratch/p312_hashcrack.py`, `p313_alg.py`, `p314_dispatch.py`, `p315_je.py` (+ `.out`) on
+`H:\FarCryCoop\TestFC3\bin\FC3.dll`, 2026-11-08. Continues the session-5 finding that the live current-mode
+id is the mode-manager field `[ebx + 0x4c]` (mode-manager `this` in `ebx`).
+
+- **The mode dispatch at `0x113405a0` is a compare-chain, not a jump table** (p315_je, the only fully-decoded
+  chain of the three): `0x113405a0 mov eax,[ebx+0x4c]`, then six `cmp eax, <id>` + conditional jumps —
+  `0xab4fc8e2 je 0x113405cd`, `0x43521e6f`(CO-OP)` je 0x113405cd`, `0x9991daec je 0x113405cd`,
+  `0x6c2b3868 je 0x113405cd`, `0xf66ffb87 je 0x113405cd`, `0x2100ced7 jne 0x11340605` (so it *falls through*
+  to `0x113405cd` when equal). **All six mode ids route to the same block `0x113405cd`**, whose strings are
+  `FCXMainMenu` + `IngameToLobby`; a current-mode that is none of the six branches to `0x11340605`. ⇒ this
+  chain is a *membership test* — "is the live mode one of these six (menu/lobby-capable) modes → main menu /
+  IngameToLobby". CO-OP is one of the six.
+- **Two sibling chains** at `0x11340622..` and `0x11340a25..` compare `[ebx+0x4c]` against the same six ids
+  with different targets (p314_dispatch, 750 insns decoded over `0x11340400..0x11340d00`). In both, only
+  `0x2100ced7` has a large downstream window (327 / 237 insns) carrying map-loading strings `CustomMap`,
+  `UI\Multiplayer\Textures\Menu\Loading\Worlds\`, `_01_1.xbt`, `\1\`; the other five ids have 2-insn windows.
+  ⇒ `0x2100ced7` is the mode that drives the per-world loading-screen textures (a multiplayer/arcade-style
+  loader); the other five share a short path.
+- **The six mode hashes are NOT any common string hash.** Brute-forced (p312, p313) a candidate name
+  vocabulary (CO-OP / Campaign / Hike / Arcade / HackThe / Expedition / Matchmaking variants, dotted engine
+  names, `PrivateCoopPlaylist`/`OfflinePlaylist`/`UserPlaylist`) against **FNV-1a, FNV-1, djb2, djb2x, sdbm,
+  murmur-less** — **0 hits**. Reference points: `fnv1a("CO-OP")=0x91c67ca9`, `djb2("CO-OP")=0x0ce785c3`,
+  `sdbm("CO-OP")=0x38ef15a2`; none equals `0x43521e6f`. ⇒ the Dunia id-hash is custom; mode names are hashed
+  at *build* time (the ids sit in `.data`, never written from `.text`, per session 5), so naming the five
+  siblings needs the hash routine recovered from the engine, or the `GameModesConfig.xml` name↔id table — not
+  offline cracking.
+
+**Net effect on the plan**: confirms session-5 — the switch reads `[ebx+0x4c]`; CO-OP (`0x43521e6f`) is one
+of six ids sharing the IngameToLobby/menu path, and `0x2100ced7` is the one mode id that loads per-world
+textures. The *static* thread on the mode dispatch is exhausted. Next real step is the owner's runtime trace
+of what writes `[ebx+0x4c]` (set a breakpoint there, capture the writer + `this`), and/or recovering the
+Dunia id-hash to name the five siblings.
+---
+
+## Session 7 (2026-11-08): offline Ghidra project + decompiled co-op mode-switch mechanism (agent session, REA/Ghidra headless)
+
+**Provenance.** After the coop-anything / supermemory / REA MCP tooling check (see `docs/tools/`),
+development continued with the new capability: the offline Ghidra project `FC3_106` (built 2026-11-08
+with `analyzeHeadless`, `-default` analysis, ~2 h, 647 MB `.rep`) now lets us export pseudocode for any
+1.06 RVA without a game run. The project lives in scratch `H:\FarCryCoop\scratch\ghidra\proj\FC3_106`
+(not committed). The reusable recipe is: `analyzeHeadless <projDir> FC3_106 -process "FC3.dll"
+-noanalysis -scriptPath <scripts> -postScript <script.java>` — loads the saved analysis and runs the
+script in about 3 minutes (no re-analysis). Proven with `DecompileH3.java`, output
+`H:\FarCryCoop\scratch\ghidra\out\decomp_H3.txt`. The owner opened the same project in the Ghidra GUI
+in parallel; read-only, no conflict.
+
+### What was decompiled (`FUN_` = Ghidra default names = 1.06 RVAs)
+
+- **Mode dispatcher `FUN_11340560`** (contains the `0x113405a0` compare-chain, body
+  `[0x11340560,0x113409cd]`, `__thiscall`, `param_1` = mode-manager `this`). Key lines:
+  - `iVar13 = param_1[0x13]` — `param_1` is `int*`, so this reads **`[this+0x4c]` = the current mode
+    id**. The six ids compared are exactly `-0x54b0371e`(=`0xAB4FC8E2`), `0x43521e6f`(CO-OP),
+    `-0x666e2514`(=`0x9991DAEC`), `0x6c2b3868`, `-0x9900479`(=`0xF66FFB87`), `0x2100ced7` — confirms
+    the static session-6 finding.
+  - If `[this+0x4c]` is one of the six AND the destination string equals `FUN_11788030("FCXMainMenu")`,
+    the target is remapped to `0x63ddbbcb` and `"IngameToLobby"` is logged. So `0x63ddbbcb` is the
+    **lobby** mode id reached when leaving a co-op-class session to the main menu.
+  - `(**(code **)(*param_1 + 0x5c))(&target)` — **the mode-manager vtable slot `+0x5c` is the actual
+    "switch to mode" virtual method**; it is called with the chosen id.
+  - `iVar13 = param_1[0x1d]` reads `[this+0x74]` (a gate flag); when set and the target is one of the
+    six or the lobby, and `param_5 == 2`, the loader builds
+    `"UI\Multiplayer\Textures\Menu\Loading\Worlds\" + "_01_1.xbt"` (the per-world loading texture,
+    the `0x2100ced7` path). Existence checked via `(*DAT_12804308)->vtable+0x10`.
+
+- **Playlist-service init `FUN_1127a0f0(int this)`** — the service activate/init method:
+  - `this[0x8c0] = FUN_1025f3f0(this)`; `this[0x8c4] = FUN_1032fbd0(this)` — creates the container
+    stored at **`[service+0x8c0]`** (and a companion at `+0x8c4`), confirming the `0x8c0` field is
+    populated at runtime (not dead, as session 5 suspected).
+  - `[container]->vtable+0x60(this+0x54)` registers a listener at `this+0x54`; then a listener array at
+    `[FUN_1031c5d0(this)+0xe0/+0xe4]` is searched/extended with `this+0x60` (`FUN_1003b4b0(1)` = new).
+  - Calls `FUN_11279a90(this)` then **`FUN_11279910(this)`** (the co-op installer, two variants).
+  - Then sets tuning fields: `[this+0x488]=2`, `[this+0x503]=0`, `[this+0x4b0]=0x32`(50),
+    `[this+0x4b4]=10`, `[this+0x4b8]=5`.
+
+- **Co-op installer `FUN_11279910(int this)`** (body `[0x11279910,0x11279a8c]`) — resolves the co-op
+  session:
+  - Lazy static seed: `if ((_DAT_12891ca4 & 1)==0){ _DAT_12891ca4 |= 1; _DAT_12891ca0 = 0x43521e6f; }`
+    — confirms session 5's H1 demotion: the `0x43521e6f` is just the **co-op query key** stored at
+    `_DAT_12891ca0` once, not a live mode lever.
+  - `FUN_113224e0(&DAT_12891ca0)` looks up entries by that key into a result array
+    (`local_14`, count `local_10[0]`, stride 3 pointers).
+  - For each entry, builds a small object on `&PTR_FUN_11f94d08`, calls `FUN_112916e0()`, then
+    `(**(code **)(**(int **)(this+0x8c0) + 0x5c))(&obj, uVar2, 0)` — i.e. **calls the container's
+    vtable slot `+0x5c` to Add the resolved co-op entry into `[service+0x8c0]`**; on success also
+    `FUN_11258c40(this+0x204, …)`.
+  - `FUN_11279fc0(this+0x54)` is a thin wrapper that re-runs the installer for the listener at
+    `this+0x54` (`FUN_11279a90(p-0x54); FUN_11279910(p-0x54)`).
+
+- **Playlist-service singleton getter `FUN_103d1640`** (body `[0x103d1640,0x103d1670]`):
+  `if ((_DAT_1286388c & 1)==0){ FUN_10302770(); FUN_10037ef0("CFCXPlaylistService"); }
+  return &DAT_12863890;`. So the singleton **instance is the object AT `0x12863890` itself**
+  (a C++ magic-static guarded by `_DAT_1286388c`), not a pointer stored there. Correction for the
+  Frida probe: the service `this` = `base + (0x12863890 - 0x10000000)` directly; do NOT
+  `readPointer()` it. `0x11fab710` (PrivateCoopPlaylist) has no function body — it is a vtable/data
+  region referenced by the installer, consistent with session 4.
+
+### Concrete Phase-2 levers now derived from static analysis
+
+1. **Populate a co-op session** without UI: call the service init path
+   `FUN_1127a0f0(service)` (with `service = 0x12863890` as `this`), which builds the `[+0x8c0]`
+   container and runs `FUN_11279910` to Add the co-op entries — or, finer-grained, resolve the entry
+   by key `0x43521e6f` via `FUN_113224e0` and Add it through the container's `vtable+0x5c`.
+2. **Switch into co-op mode**: set `[modeManager+0x4c] = 0x43521e6f` and call
+   `modeManager->vtable[+0x5c](0x43521e6f)`. `[modeManager+0x74]` gates the loading-texture branch.
+   The mode-manager `this` is still runtime-only (a debugger/Frida read), but the method and offset are
+   now pinned, so the trace is one breakpoint, not a hunt.
+
+### New Frida script
+`scripts/fc3_h3_trace.js` (committed with this section): reads the live `[this+0x4c]` from the mode
+manager, the `[service+0x8c0]` container, and logs the playlist-service slots. NOTE: its `service`
+line must use `0x12863890` as `this` directly (see the getter correction above), not
+`readPointer()`.
+
+### Session 7 addendum — the switch-virtual ABI is disasm-confirmed (headless `DisasmSwitch.java`)
+
+We disassembled `FUN_11340560` from the offline `FC3_106` project (`scripts/ghidra/DisasmSwitch.java`,
+output `H:\FarCryCoop\scratch\ghidra\out\disasm_switch.txt`, 364 insns). The vtable `+0x5c` call site is
+`0x11340605` and the calling convention is a plain MSVC **thiscall** (this in ECX, the one argument pushed):
+
+```
+11340605  MOV EDX,[EBX]          ; EDX = this->vtable            (EBX = modeManager this)
+11340607  MOV EDX,[EDX+0x5c]     ; EDX = vtable[+0x5c]           (function pointer)
+1134060a  LEA EAX,[ESP+0x10]     ; EAX = &target_id (4-byte local on stack)
+1134060e  PUSH EAX               ; push the single &id argument
+1134060f  MOV ECX,EBX            ; ECX = this  (thiscall)
+11340611  CALL EDX               ; the mode switch
+11340613  MOV EDX,[EBX+0x74]     ; after: the gate [this+0x74]
+```
+
+At function entry `MOV EBX,ECX` (`0x1134056a`) shows the dispatcher itself gets `this` in ECX. So
+`switchCoop`'s `NativeFunction(slot,'int',['pointer','pointer'],'thiscall')` called as
+`(this=mm, &id)` is correct: Frida `thiscall` puts arg1 in ECX and the rest on the stack. `[this+0x4c]`
+is read at `0x113405a0` (`MOV EAX,[EBX+0x4c]`); the six-id compare that follows the switch is the
+`0x11340622` chain (matches the session-6 "three chains"). **Residual risk is not the ABI but context:**
+`switchCoop` calls the switch-virtual directly, outside the dispatcher, which also runs
+`(**(code**)(*param_1+0x20))()` and other bookkeeping at entry — so the live test can still misbehave or
+crash for reasons other than the register convention. Hence dryRun + offline instance first.
+
+## Session 8 (2026-11-08): DX9 live attach + the mode-manager object is not alive at the menu (agent session, Frida + REA/Ghidra headless)
+
+Goal: capture the live mode-manager `this` (the ECX/EBX at the dispatch) so `switchCoop` can be driven,
+and read the live `[service+0x8c0]` container. The whole session was on the owner's working copy
+`H:\FarCryCoop\TestFC3\` (the real Uplay install untouched), 1.06 `FC3.dll`.
+
+### The game had to be switched to the DX9 build to load FC3.dll at all
+The Steam working copy launches the **DirectX 11** binary `farcry3_d3d11.exe` by default, which does
+**not** load `FC3.dll` (DX11 ships `FC3_d3d11.dll`), so every address in the trace was unmapped. The
+**DX9** binary `farcry3.exe` (a 60672-byte stub, hash `73a2870f827d3f305681f2198f232bf2f08172097411091543a7f3e5539f9641`)
+**does** load `FC3.dll` — our 1.06 identity. `scripts/fc3_h3_run.py` now defaults to `farcry3.exe` and
+refuses to attach to `_d3d11`. Live module base varies per run (this run `0x798a0000`; `A(x)=base+(x-0x10000000)`).
+
+### The co-op UI is online-gated; offline it aborts before the mode switch
+The owner attached `scripts/fc3_h3_run.py --watch 90` and navigated to the multiplayer/co-op menu, but
+the game showed the in-game error **"Служба сетевой игры больше недоступна"** ("the network game service is
+no longer available") — Ubisoft netplay is unavailable offline — and **aborted before any mode change**.
+The dispatch hook at `0x113405a0` never fired (`WATCH DONE ... NONE - no mode transition fired`). So FC3's
+co-op cannot be entered through the UI while offline; the internal H3 approach is precisely a bypass of that
+gate, but it still needs a live mode-manager `this`.
+
+### The dispatcher is invoked ONLY virtually (headless `DumpCallers.java`)
+`scripts/ghidra/DumpCallers.java` (offline `FC3_106` project) shows `FUN_11340560` (the dispatcher; dispatch
+point `0x113405a0`, `thiscall this` = the mode manager) has **zero direct CALL xrefs** — its only two xrefs
+are DATA, both **vtable slots**: `0x1200e658` (vtable base `0x1200e620`, 15 slots) and `0x11f91120` (vtable base
+`0x11f910e8`, 16 slots, several slots are the purecall thunk `0x1061fee0` => an abstract/interface table). In
+both tables `FUN_11340560` sits at slot **`+0x38`** (see `scripts/ghidra/DumpVtable.java` -> `out/vtable_mode.txt`).
+The vtable stores the function **entry** `0x11340560`, not the mid-function dispatch point.
+
+### The live mode-manager instance does not exist at the menu (two independent scans, both empty)
+- `scanmm` (heap id-scan, `[obj+0x4c]` == one of the six mode ids): only three mode-**descriptor** objects
+  with id `0x6c2b3868` (vtables `0x1f1a128`/`0x1f3a8b8`/`0x1f6aacc`), not the manager.
+- `scanmmv` (heap scan for a live `vptr == A(0x1200e620)` or `A(0x11f910e8)`): **0 instances**.
+- `modevt` (`scanModeManagerByVtable`'s successor `findModeVtablesByDispatch`, added + fixed this session):
+  scans the readable **image** ranges for the function-entry pointer `0x11340560` (auto-discovers every vtable
+  that dispatches through it, base and derived), then scans the `rw-` heap for live objects of each. Result:
+  exactly **2** image vtables found — `A(0x1200e620)` and `A(0x11f910e8)` — confirming the static analysis, but
+  **0 live instances** of either.
+
+Conclusion (deterministic): **no object of the two dispatcher-implementing classes is constructed while the
+game sits at the main/co-op menu.** The mode manager is instantiated only around a real mode activation. The
+only deterministic way to read `this` is to catch the dispatcher live during a transition the game **can** do
+offline — a **single-player world load** (Main Menu -> Continue / Load Checkpoint), not the offline-blocked
+co-op menu. `[service+0x8c0]` (the co-op playlist container, service object at the singleton `0x12863890`)
+was also re-checked and is still `0x0` at the menu.
+
+### Tools touched this session (committed, pushed to the agent fork)
+- `scripts/fc3_h3_run.py`: `--watch N` auto mode (attach, poll `lastMode` 1 Hz, log `[MODECAP]`, auto-detach);
+  commands `scanmm`, `scanmmv`, `modevt`.
+- `scripts/fc3_h3_trace.js`: `scanModeManager` (id-scan), `scanModeManagerByVtable` (static-vtable scan),
+  `findModeVtablesByDispatch` (`modevt`: image-wide vtable discovery + heap instance scan, caches the first
+  live instance into `lastMode` for `switchCoop`). `ADDR.mmDispatchFn = 0x11340560` (the slot value).
+- `scripts/ghidra/DumpCallers.java`, `scripts/ghidra/DumpVtable.java` + `run_dump_vtable.bat` (offline reuse).
+Commits (agent fork `main`): `b74c165` (add modevt discovery), `a3aac57` (fix modevt: search the entry pointer,
+in the image, then instances in the heap). Supermemory record `jiAFbWDzn3UFD5x3X5Uj9g`.
+
+### Session 8c (2026-11-08): the live vtable + the +0x5c "switch" is only an id-setter (H3a demoted)
+
+The `--watch` + single-player-load capture repeated and the new auto-`[MODEPROBE]` gave the live
+mode-manager layout (run base `0x798a0000`, `this`=`0x298db6d0`):
+
+- `curMode` `[this+0x4c]` = `0x80608f71` this run (was `0x83AE70EF` last run) -> `[this+0x4c]` is NOT a
+  stable mode id and is never one of the six dispatch ids.
+- `[this+0x20]` = `0x0`, `[this+0x74]` = `0x100dbd00` (a module pointer, i.e. the "gate" is a live member,
+  so the dispatcher's loading-texture branch is taken).
+- **primary vtable = `0x7a56e5f8` -> Ghidra `0x1200e5f8`** (in image). The two vtables the `modevt` scan kept
+  reporting (`0x1200e620`, `0x11f910e8`) were *not* the object's vptr: `0x1200e620` is this same object's
+  **secondary** base-class subobject at primary+`0x28` (multiple inheritance). That is exactly why
+  `scanmmv`/`modevt` found 0 instances: an object's `+0` vptr is the primary table `0x1200e5f8`, which those
+  scans never looked for. The dispatcher `FUN_11340560` sits at **primary `+0x60`** (`0x1200e658`), which equals
+  the secondary table's `+0x38` (`0x1200e620+0x38`) - that coincidence is what made the `+0x38`-assumption scan
+  report a bogus base.
+
+Primary vtable slot targets (runtime-probed, Ghidra RVAs): `+0x20 -> 0x1133fb30` (no function: a thunk slot),
+`+0x38 -> 0x10c471b0`, **`+0x5c -> 0x1030f8a0`** (the virtual the dispatcher calls as the "switch"), `+0x60 ->
+0x11340560` (the dispatcher itself).
+
+Decompiled (offline `FC3_106`, `scripts/ghidra/DecompileModeSwitch.java` -> `out/decomp_modeswitch.txt`):
+
+```
+void __thiscall FUN_1030f8a0(int this, undefined4 *param_2)   // vtable[+0x5c]
+{
+  *(undefined4 *)(this + 0x4c) = *(undefined4 *)(this + 0x48);   // prev = cur
+  *(undefined4 *)(this + 0x48) = *param_2;                        // cur  = targetId
+  return;
+}
+```
+
+**So the `vtable[+0x5c]` "switch virtual" is a two-line id-swizzle, not a transition.** It records the target id
+into `[this+0x48]` and shifts the old one to `[this+0x4c]`; it does **not** load a world, build a session, or
+touch the playlist service. Consequence for H3a: `switchCoop` (write `[this+0x4c]=CO-OP` + call `vtable[+0x5c](&CO-OP)`)
+would be harmless (it can't crash on this path, so the owner does NOT need to risk it) but **useless for
+entering co-op** - it only sets two id fields. `[this+0x48]` is the "current/target" id, `[this+0x4c]` the
+"previous" id; the dispatcher's six-id compare and the loading-texture branch consume them, and the real work
+(map/world load, session bring-up) happens in consumers of `[this+0x48]` and in the dispatcher's *caller* - which
+invokes the dispatcher-virtual (`vtable[+0x60]`) with `(param_2=&destId, param_3=refcounted ptr, param_4,
+param_5)` and is not findable by static xref (indirect through the object). The dispatcher has zero direct
+callers; only objects of this class call it through the vtable.
+
+This demotes H3a as the co-op entry mechanism. New leads: (1) find the consumers of `[this+0x48]` / the
+dispatcher-virtual `+0x60` callers to locate the code that actually acts on a co-op target id; (2) the co-op
+container `[svc+0x8c0]` is still `0x0` in-world, so the co-op session/playlist (and its netplay prerequisite)
+must be brought up before any co-op target id would do anything - which offline is blocked by the Ubisoft
+network-service gate. A clean co-op transition most likely must be **captured online** (watch a real 2p join)
+and only then reasoned about for offline/4p reconstruction.
+
+### Session 8d (2026-11-08, offline Ghidra, H4b): the real co-op mode-change handler + its preconditions
+
+Offline path (owner chose H4b: online co-op unavailable). Reused the analyzed `FC3_106` Ghidra
+project (no re-analysis; `scripts/ghidra/run_headless.py <Script.java> <log>` wrapper). Two new
+scripts: `FindModeConsumers.java` (every function that loads a mode-id immediate as a scalar
+constant, + xrefs to the manager vtables) and `DecompileConsumers.java` (decompile the hits).
+Out: `H:\FarCryCoop\scratch\ghidra\out\decomp_consumers.txt` + `find_mode_consumers` log.
+
+**Mode-id constant universe (13 of 128384 functions load one of the ids as a constant).** The
+co-op key `0x43521e6f` appears in: `FUN_10f0c770`, `FUN_10f4ca20`, `FUN_10f92420`, `FUN_11279910`/
+`FUN_11279a90` (the H1 installer, known), `FUN_11a7f9d0`, the dispatcher `FUN_11340560`, its loader
+sibling `FUN_113409d0`, and the handler `FUN_10fa1990`. Functions loading the FULL six-id set
+{`0xab4fc8e2`,`0x43521e6f`,`0x9991daec`,`0x6c2b3868`,`0xf66ffb87`,`0x2100ced7`}: `FUN_10fa1990`,
+`FUN_11204b00` (five, no co-op key), `FUN_11340560`, `FUN_113409d0`. Lobby id `0x63ddbbcb` only in
+`FUN_113401c0` and `FUN_11340560`.
+
+**Mode-manager class identity (primary vtable `0x1200e5f8` has exactly two xrefs, both DATA):**
+`FUN_10fa1e30` (destructor/`__fastcall`) and `FUN_10fa1eb0` (constructor) write `*obj = &PTR_FUN_1200e5f8`.
+Constructor object layout (dword indices, so byte offset = idx*4): `[*0]` vptr `0x1200e5f8`;
+`[2]`(+0x08) = `&PTR_LAB_1200e660`; `[0xf]`(+0x3c) = `&PTR_LAB_1200e668`; a secondary base subobject is
+constructed at `obj+0x28` by `FUN_112709d0` (explains the earlier 0x1200e620 secondary being at
+primary+0x28); fields `[0x4d]`,`[0x4e]`,`[0x52]`,`[0x53]`=0, `[0x51]`byte=0, `[0x50]`=-1 then set to a
+handle copied out of global `DAT_12821398` via `FUN_1015b680`. Vtable slots (confirmed): `+0x50` getter,
+`+0x5c`=`FUN_1030f8a0` (the id-swizzle), `+0x60`=`FUN_11340560` (the dispatcher). So the earlier
+"vtable+0x5c is only an id-setter" stands, and this is the full class layout.
+
+**The real mode-change handler is `FUN_10fa1990`** (`__thiscall(this=manager, param_2, param_3)`),
+in the SAME page as the constructor and the full-six-id compare. Flow:
+- refcounts `param_2` (a wrapped destination mode-id) and `param_3` (a descriptor object), sets
+  `local_c = this`;
+- calls **`FUN_11340d00(param_2, param_3)`** - the transition CORE that actually applies the new mode;
+- calls `this->vtable[+0x50](&local_10)` to read the resolved current/new mode id into `iStack_14`;
+- reads the central object `DAT_12804acc`: gate `[DAT_12804acc+0x6c]`, handle `[DAT_12804acc+0x68]`
+  passed to `FUN_103a9ea0` (a session/handle lookup);
+- then branches on the resolved id and picks the LOADING SCREEN text: **`iStack_14 == 0x43521e6f`
+  (CO-OP) -> logs `"Coop_Fenrir_Loading"`** (Fenrir = the co-op codename); `-0x54b0371e` ->
+  `"PvP_Dom_Loading"`; the other special ids just jump ahead. For co-op it also reads
+  `param_3+0xC` three times via `FUN_10003f00` (a name/string predicate) and gates on
+  **`FUN_1011cb30()`** (a co-op availability/enabled predicate, called up to 5x).
+- finally `FUN_110252d0(...)` and, if `[DAT_12804b3c+0x70]==1`, two virtual calls through
+  `*(int*)(local_10+0xa0)+0x64/0x6c`.
+
+Its loader sibling **`FUN_113409d0`** (`this, param_2=destId, param_3, param_4`) is the multiplayer/
+co-op loading-screen SETUP: if `*param_2` is one of the six ids it sets byte `[this+0x44]=1`, stores
+`param_3` to `[this+0x90]` (refcounted), loads `"UI\Multiplayer\Textures\Menu\Loading\Worlds\"`
++ `"_01_1.xbt"`, then `FUN_117872f0(...)` and `FUN_103a2d50(...)`.
+
+**Answer to the H4b question (is there ONE function that brings up the co-op world by target id, and
+what does it need besides `this`?):** the single entry is **`FUN_10fa1990`** (core `FUN_11340d00`),
+NOT a poke of `[this+0x48]`+`vtable[+0x5c]`. Besides `this` it needs: (a) `param_2` = a wrapped
+CO-OP id (`0x43521e6f`), (b) `param_3` = a co-op **descriptor object** whose `+0xC` holds a map/world
+name string (validated by `FUN_10003f00`), (c) the availability predicate `FUN_1011cb30()` to return
+true, and (d) a live **session handle** reachable from `DAT_12804acc+0x68` / the co-op playlist
+`[svc+0x8c0]`. Items (c) and (d) are the offline wall: `FUN_1011cb30` reflects co-op availability and
+the handle/playlist come from netplay, which is offline-disabled ("service no longer available") and
+`[svc+0x8c0]` stays `0x0` even in a loaded world. So even calling `FUN_10fa1990(this, coOpId, desc)`
+directly offline reaches `"Coop_Fenrir_Loading"` and then has no session/map to load. **Net H4b
+conclusion: offline there is no self-contained co-op bring-up to hijack; the descriptor + session are
+produced by the online lobby flow we cannot observe offline.** Next candidate worth a static read is
+`FUN_11340d00` (the transition core) and `FUN_1011cb30` (the availability gate), to confirm whether a
+fake descriptor could bypass the predicate.
+
+### Session 8e (2026-11-08, offline Ghidra): the transition core + availability predicate are NOT netplay-gated (offline co-op is not precluded at the mode layer)
+
+Continued H4b offline (owner asked): decompile `FUN_11340d00` (transition core) and `FUN_1011cb30`
+(co-op availability predicate as earlier believed), and judge whether a fake descriptor `param_3`
+could bring up a co-op world offline. Scripts `DecompileCore.java` (targets 11340d00, 1011cb30,
+10003f00, then 117872f0, 103a2d50, 11788030); out `decomp_core.txt` / `decomp_core2.txt`.
+
+**Correction to session 8d:** `FUN_1011cb30` is NOT an availability/netplay gate. It is a trivial
+empty-string predicate called from 30+ generic sites:
+```c
+bool __fastcall FUN_1011cb30(int *param_1) {        // not void; the arg is ecx/pushed
+  if (*param_1 == 0) return *in_EAX == ' ';
+  return FUN_10003f00(*param_1 + 0xc) == 0;         // "is the descriptor's +0xC name string empty?"
+}
+```
+So in `FUN_10fa1990`'s co-op branch the `FUN_1011cb30()` calls are just re-checking descriptor
+name-string fields, not a network availability check.
+
+**`FUN_11340d00` (transition core) is a thin guard wrapper**, no netplay:
+```c
+void __thiscall FUN_11340d00(int this, int *destId, int *descriptor) {
+  if (*(char *)(this + 0x19) == 0) {                // guard: not already transitioning
+    refcount destId, descriptor;
+    FUN_113409d0(this, this + 0x48, destId, descriptor);   // loader; 2nd arg = &this->modeId
+  }
+  *(undefined1 *)(this + 0x70) = 1;                 // "a mode change was requested" flag
+  ... refcount cleanup
+}
+```
+Only caller: `FUN_10fa1990` (+ one DATA xref at 0x11f910cc = a vtable slot in the secondary cluster).
+
+**The two load handoffs the loader calls are generic engine helpers, not session calls:**
+- `FUN_117872f0` reads the global `DAT_12804324` (a current-game/world string global); if set, copies a
+  string and resolves it via `FUN_11787e80` (returns an id pair into EDI, else `{0xffffffff,0xffffffff}`).
+- `FUN_103a2d50(param_1=&out, param_2=keyPair)` is a hash-table lookup: `idx = ((param_2 ^ 0xdeadbeef)
+  * ...) % buckets` into `unaff_EDI + 0xc`, walks the bucket list comparing the key pair
+  (`piVar3[2]`,`piVar3[3]`) and returns the entry pointer (or `{0,0}`). A generic registry find-by-id.
+
+**Verdict on the owner's three questions:**
+1. **`FUN_1011cb30` dependency:** only the descriptor's `+0xC` string being non-empty. Trivially
+   satisfied by a well-formed descriptor; NOT a netplay/online gate, so "forcing it true offline" is
+   not even the issue.
+2. **What `FUN_11340d00` does on a co-op id:** guards on `[this+0x19]==0`, refcounts the id/descriptor,
+   calls the loader `FUN_113409d0` (which checks the target id against the six special ids and sets up
+   the multiplayer/co-op loading screen + Worlds textures), and sets `[this+0x70]=1`. No network code.
+3. **Can a fake descriptor push a co-op world offline?** The **mode layer is not offline-locked** - none
+   of `FUN_10fa1990` / `FUN_11340d00` / `FUN_113409d0` / `FUN_117872f0` / `FUN_103a2d50` calls the
+   network service. The "service unavailable" abort is UPSTREAM in the online lobby that (a) refuses to
+   advance offline and (b) normally builds `param_3` and populates the session globals. So the offline
+   blocker is not a hard check but *missing inputs*: a valid `param_3` co-op descriptor object (its
+   class/vtable + the `+0xC` map-name string layout are not yet mapped) and coherent session globals
+   (`DAT_12804acc+0x6c` flag, `+0x68` handle, `DAT_12804324` world string). Whether a hand-built
+   descriptor yields a **playable** co-op world (vs stalling at the async engine load that expects
+   session data) can only be settled by a live experiment. Next concrete offline lead: map the
+   descriptor object's class (its vtable + `+0xC` string field) via the online-lobby producer, OR probe
+   whether a single-player world string in `DAT_12804324` lets `FUN_117872f0` resolve a loadable map.
+
+### Session 8f (2026-11-08, offline Ghidra): the param_3 descriptor is a mode-entry of a global mode-list singleton `DAT_128048c0`
+
+Answer to "what object is passed as `param_3`": a **mode-descriptor entry** living in a global
+singleton list, NOT a per-call freshly built object. Scripts `TraceDescriptor.java`,
+`TraceRegistry.java`, `DecompRegistry.java` (xrefs + decompiles).
+
+**Entry point into the mode-change is a vtable slot:** `FUN_10fa1990` has exactly one xref, a DATA
+slot at `0x1200e604` = the mode-manager primary vtable `0x1200e5f8` **`+0x0C`**. So co-op entry is
+invoked as `mgr->vtable[+0x0C](destId, descriptor)` (virtual; no static caller, same reason the
+dispatcher has none). `FUN_10fa1990(this, param_2=destId, param_3=descriptor)` refcounts both, calls
+`FUN_11340d00(param_2, param_3)`, reads the resolved id via `this->vtable[+0x50]`, then the id branch
+(`0x43521e6f` -> "Coop_Fenrir_Loading").
+
+**Descriptor (`param_3`) layout** (from all its consumers): `+0x00` intrusive refcount (LOCK/`+1`/`-1`
+seen in every holder), `+0x0C` a **name string** (`char*`, validated by `FUN_10003f00`/`FUN_1011cb30`),
+`+0x20` a **mode id dword**. In `FUN_113409d0` the loader STORES the used descriptor at `[mgr+0x90]`
+(refcounted) and calls `**(*mgr+0x60))(destId,&x,&descriptor,1)` (re-dispatch).
+
+**Where the descriptor comes from - the global mode-list singleton `DAT_128048c0`:**
+```c
+piVar4 = *(int **)(DAT_128048c0 + 4);            // list data pointer (entries)
+piVar1 = piVar4 + *(int *)(DAT_128048c0 + 8);    // end = base + size
+for (; piVar4 != piVar1 && *(int*)(*piVar4 + 0x20) != *param_2; piVar4 = piVar4 + 1) {}
+```
+So `DAT_128048c0` is a manager whose internal array is at `+0x04` (data) / `+0x08` (size); the loader
+**linearly finds the entry whose `+0x20` == the target mode id**. That found entry is the descriptor.
+
+**Singleton lifecycle:** `DAT_128048c0` is created lazily by `FUN_10048230` (allocate via the
+`FUN_118db560` singleton factory, `*obj = &PTR_FUN_11f224c4` (the list-manager vtable), zero
+`+0x00..+0x18`, publish) and destroyed by `FUN_11756e00` (a **teardown/shutdown**: `(**(*obj))(1)`
+delete + set null, also clears `DAT_12804acc`). So this is not the online-populate site; the actual
+mode-entry registration is via the list-manager vtable `0x11f224c4` (virtual adder - not statically
+resolvable, needs a live read).
+
+**Net for "build a descriptor by hand":** a valid co-op descriptor = an object with `+0x20 = 0x43521e6f`
+and `+0x0C = a co-op map/world name`, reachable in the `DAT_128048c0` list. The decisive open question
+is now empirical and cheap to answer **live**: does the running DX9 game already contain a `+0x20 =
+0x43521e6f` entry in `DAT_128048c0`'s list offline? If yes -> hand-drive `mgr->vtable[+0x0C]` with that
+entry; if no -> the co-op entry registration is the real offline gate. Prepared `dumpModes` (tracer RPC)
+to enumerate `DAT_128048c0` list entries (`{id@+0x20, name@+0xC}`) next live session. Globals written
+by exactly 3 sites each: `DAT_128048c0` = {`FUN_10048230` ctor, `FUN_11756e00` dtor, `FUN_11756e00`};
+`DAT_12804acc` = {`FUN_100480f0`, `FUN_117567c0`, `FUN_11756e00`}; `DAT_12804b3c` = {`FUN_10136900`,
+`FUN_11629c30`}.
+
+### Session 8g (2026-11-09, LIVE, self-run): the CO-OP mode entry is already in the offline mode registry
+
+Self-served the whole live loop (no owner clicks needed for this one): launched the offline test copy
+`H:\FarCryCoop\TestFC3\bin\farcry3.exe` (direct exe, cwd `bin`, DETACHED_PROCESS), let it boot, then
+drove `scripts/fc3_h3_run.py` with piped stdin `dump\nmodes\nquit` (frida 17.26.2). The `modes` command
+needs NO in-game action, so unlike the dispatch-hook capture this is fully automatable by the agent.
+
+**Milestone answer to the session-8f open question:** the live global mode-list singleton
+`DAT_128048c0` is **populated with 16 entries OFFLINE**, and **entry index 7 has `+0x20 = 0x43521e6f`
+(CO-OP)**. So entering co-op is NOT gated on the online path at the registry level - the co-op mode
+descriptor already exists in a running offline game. Hand-driving `mgr->vtable[+0x0C](destId,
+descriptor)` with that entry does not require an online 2p join.
+
+Live capture (this run, base varied): manager `this` runtime `0x10270a60`, vtable `0x7aa024c4`
+(= Ghidra `0x11f224c4`, matches the static ctor finding), `+0x08` count = `16`, data ptr list base.
+All 16 mode ids (`+0x20`), in order: `0x7520e174, 0x83ae70ef, 0xcd0b222f, 0xcb5df48c, 0x863659d2,
+0x9216b3de, 0x80608f71, 0x43521e6f[COOP], 0xff56cf71, 0xc8ab0853, 0x8b40f692, 0x6c2b3868, 0xab4fc8e2,
+0x9991daec, 0xf66ffb87, 0x2100ced7`. All six dispatcher ids are present, plus `0x80608f71` (a previously
+observed live current-mode id).
+
+**Layout correction:** `+0x0C` read as `char*` returned "(unreadable)" for every entry, so `+0x0C` is
+NOT the name-string for these list entries (the `+0xC` name in the session-8f note applies to the
+`param_3` use inside `FUN_10fa1990`, not to the registry-entry struct at the same offset). Confirmed
+field remains `+0x20` = mode id; `+0x00` = refcount. Next: identify each entry's real fields (esp. the
+map/world string and the per-mode data the loader reads) so the co-op entry can be driven.
+
+**Constraint reaffirmed:** the game was launched DIRECT (not via Ubisoft Connect) so it runs offline;
+frida attach must stay to such offline instances only (anticheat/mutex guard). Ubisoft Connect was
+running (UplayWebCore.exe x6) but the direct `farcry3.exe` launch boots its own offline instance.
+
+### Session 8h (2026-11-09, LIVE): robust mode-manager capture + hand-driving the mode-change virtual is safe but a no-op offline
+
+Two concrete results from a live self-run (offline `farcry3.exe` on this PC).
+
+1. **Robust manager capture, no mode change needed.** `scanModeManagerByVtable` now includes the
+   CONFIRMED primary vtable `0x1200e5f8` (added as `ADDR.mmVtable0`). A single heap vptr scan returned
+   exactly one instance: live mode-manager `this = 0x294dd3a0`, `[this+0x4c] = 0x83ae70ef`, vtable
+   `0x7aaee5f8` (= `0x1200e5f8`). This finally yields the manager without relying on catching a real
+   transition (the old scan only looked at the bogus secondary bases `0x1200e620`/`0x11f910e8`).
+
+2. **`coopEnter` RPC (`coop dry|go`)** calls `modeManager->vtable[+0x0C]` with `(&CO-OP id, descriptor)`
+   and auto-resolves the live CO-OP registry entry (the `DAT_128048c0` entry with `+0x20 == 0x43521e6f`)
+   in-session. Dry run confirmed slot `+0x0C -> 0x79a81990` = Ghidra **`FUN_10fa1990`** (the real
+   mode-change handler, not the `+0x5c` no-op setter `FUN_1030f8a0` that `switchCoop` calls).
+
+3. **LIVE `coop go` result:** the call RETURNED (no crash; game still alive, pid 14932, ~548 MB) with
+   `ret = 0x1026...` but **`[this+0x4c]` was UNCHANGED (`0x83ae70ef` before and after)**. So calling the
+   mode-change virtual from the Frida thread is SAFE but does **not itself flip the current mode**. The
+   handler does bookkeeping/refcounts; the actual switch is polled/driven later on the game's main
+   update thread (and, for the CO-OP branch, almost certainly needs a co-op session object that an
+   offline game does not construct). The outer driver timed out only because the RPC read blocked a while
+   after the call; the script itself logged `ret` + clean `detaching`.
+
+Next lead: find what CONSUMES the handler's pending target on the main thread (which `[this+...]` field
+it reads next frame) and whether an offline co-op session can be pre-seeded, rather than blindly calling
+the entry virtual.
+
+### Session 8i (2026-11-09, OFFLINE Ghidra FC3_106 + LIVE): the mode-change call topology is fully mapped; the offline blocker is the netplay session object, not an id/field gate
+
+Continued the H4b offline lead (online co-op is unavailable to the owner, so we cannot capture a real
+join). Combined the cached FC3_106 decompilation with new live reads. Added three Frida RPCs to
+`scripts/fc3_h3_trace.js` + commands to `scripts/fc3_h3_run.py`: `mmFields`/`mmf` (reads the
+mode-manager fields the transition path keys on), `loadCoop`/`loadcoop dry|go` (writes the pending
+destination then calls the loader directly), `netgate`/`ng` (reads the co-op-availability gate).
+`scripts/ghidra/DecompTransition.java` lists the CALL xrefs of the three transition functions.
+
+Call topology (static, FC3_106):
+
+- `FUN_10fa1990` = **modeManager->vtable[+0x0C]** (confirmed: its only xref is the DATA slot at
+  `0x1200e604` = primary vtable `0x1200e5f8` + 0x0C). No direct CALL xrefs -> invoked purely by vtable
+  dispatch. It refcounts `(param_2, param_3)`, calls `FUN_11340d00(piVar4, piVar5)`, calls
+  `vtable[+0x50](&local_10)` (which supplies the destination id `iStack_14` the branches switch on),
+  then gates the whole CO-OP/PvP setup on `*(char*)(DAT_12804acc + 0x6c) != 0` (the **co-op / netplay
+  "session available" byte**). For `iStack_14 == 0x43521e6f` (CO-OP) it reads the descriptor string at
+  `param_3 + 0x0C` and logs `"Coop_Fenrir_Loading"`; sibling ids log `"PvP_Dom_Loading"` etc.
+- `FUN_11340d00` = the **enqueue driver** (only caller of the loader). `if (*(char*)(this + 0x19) == 0)`
+  (transition-in-progress gate) -> `FUN_113409d0(this, &this[0x48], piVar2, piVar3)`; then sets
+  `this[0x70] = 1`. The **PENDING DESTINATION MODE ID is stored at `modeManager + 0x48`** (passed by
+  address to the loader). Also installed as a vtable slot at `0x11f910cc`.
+- `FUN_113409d0` = the **actual loader** (its only CALL caller is `FUN_11340d00`). Reads the destination
+  id via `iVar2 = *param_2` (i.e. `[this + 0x48]`); stores the descriptor at `this + 0x90`
+  (`param_1 + 0x24`, `param_1` is `int*` here so the offset is x4); if the id is in
+  `{0xAB4FC8E2, 0x43521e6f (CO-OP), 0x9991DAEC, 0x6c2b3868, 0xF66FFB87, 0x2100CED7}` it sets a
+  "loading" flag byte at `this + 0x44` (`*(undefined1*)(param_1 + 0x11)`) and logs
+  `"UI\Multiplayer\Textures\Menu\Loading\Worlds\"`. **The CO-OP branch is keyed off `[this+0x48]`, not
+  an argument.** (Watch the `int*` vs raw-byte offset difference: in `FUN_11340d00` `param_1` is a raw
+  `int`, so `+0x19`/`+0x70` are raw byte offsets; in `FUN_113409d0` `param_1` is `int*`, so the
+  decompiler's `+0x11`/`+0x24` are byte `0x44`/`0x90`.)
+
+Live results (offline `farcry3.exe`, manager found by `scanmmv` at vtable `0x1200e5f8`):
+
+- `mmf` on the live manager (`this = 0x29256950`): `pending48 = 0x83ae70ef` (= `cur4c`) -> confirms
+  `+0x48` is the pending/destination field; in-progress gate byte `+0x19 = 0` (open); held descriptor
+  at `+0x90 = 0x78de4500`. `loadcoop dry` resolves the live CO-OP registry entry descriptor `0x10253d00`.
+- `netgate`: **`DAT_12804acc + 0x6c = 0x1` -- the co-op "session available" gate is OPEN offline.** This
+  REFUTES the earlier guess that an offline gate blocks the co-op branch. Handle `+0x68 = 0x1033ca00`.
+- `loadcoop go`: write `this+0x48 = 0x43521e6f` then call the loader `FUN_113409d0(this, &this+0x48,
+  descriptor, 0)` from the Frida thread. The game SURVIVES (no crash), `[this+0x48]` stays CO-OP, but
+  the current mode `[this+0x4c]` stays `0x83ae70ef` -- the mode does **not** flip. (Frida x86 rejects the
+  NativeFunction abi string `'cdecl'`; omit the abi arg to get cdecl semantics.)
+
+Verdict: the entire mode-change subsystem is present and its CO-OP code-path is statically reachable
+(gate open, CO-OP registry entry exists, loader has a CO-OP branch keyed off `[this+0x48]`). But calling
+the handler (`vtable+0x0C`) or the loader directly from the Frida thread only performs bookkeeping and
+sets a "loading" flag; the actual world/session bring-up happens later on the game's main thread and
+needs a real co-op **session object** that only a netplay join constructs. Driving ids/fields alone
+cannot fabricate that session offline. **The true remaining blocker is the netplay/session layer, not a
+mode id or a field gate.** Next lead (if pursued): construct/pre-seed the co-op session object the main
+thread's loader step expects -- a much deeper effort into the netplay code, on the critical path to any
+offline 4p attempt.
+
+## Session 9 (2026-11-09): the netplay session object the co-op loader consumes - offline constructibility verdict (agent session, offline Ghidra FC3_106 + live Frida)
+
+Owner prompt (2026-11-09): trace which netplay/session object the loader step consumes on the
+main thread after `this+0x48 = CO-OP`, find its constructor, fields, and where it is created at
+netplay-join; decide whether it can be constructed/pre-filled offline.
+
+Method: reuse the offline Ghidra project `FC3_106` (`python -I H:\FarCryCoop\scratch\ghidra\scripts\run_headless.py <Script>.java <log>`, ~30 s, no re-analysis). New scripts in `H:\FarCryCoop\scratch\ghidra\scripts\`: `DecompSession.java` (decompiles the loader's session-gate helpers) and `DecompSession2.java` (the session-slot writer + a transition-path reader, then the two decompile targets). Decompiles cached at `H:\FarCryCoop\scratch\ghidra\out\decomp_session.txt`, `decomp_session2*.log`.
+
+### The chain that consumes the session object (1.06 RVAs, thiscall this = mode manager unless noted)
+- `FUN_113409d0(this, &this+0x48, desc, p4)` = the loader. Reads `*(&this+0x48)` = pending mode id. If it is one of the six (CO-OP `0x43521e6f` included) it sets the loading flag byte `this+0x44=1` and builds the `Loading\Worlds\` UI, then calls `FUN_117872f0()` and the **hashmap lookup `FUN_103a2d50(&out, &pending)`**. Real dispatch happens only **`if (out != 0 && *(out+0x10) != 0)`** -> `(*(this->vtable+0x60))(&pending, &p4, &desc, 1)`; otherwise it falls to the **offline/local path `FUN_113400f0`** (callers of `FUN_113400f0` are only `FUN_113409d0` and the dispatcher `FUN_11340560`).
+- `FUN_103a2d50(this, out_pair, key)` = hash-map probe: `this+0x8` = bucket count, `this+0xC` = bucket array; `hash(key) = (key ^ 0xdeadbeef)` folded via `ldiv(.., 0x1f31d)`; walks the chain comparing `node+0x08/+0x0C` to the key; on hit returns the node, whose `+0x10` value object must be non-null for real dispatch. This is the second netplay-populated structure.
+- `FUN_10fa1990(this, &id, desc)` = mode-change handler (mode manager `vtable+0x0C`). After enqueueing it reads the **active session** `iVar2 = FUN_103a9ea0(*(DAT_12804acc+0x68))`; the CO-OP branch additionally requires `iVar2+0x1c in {DAT_1216ca90, DAT_1216ca9c}` and `iVar2+0x8c != -1 && iVar2+0x90 != -1` (host id, member id), then calls `FUN_111854f0(iVar2+0x8c, iVar2+0x90)` and `FUN_110252d0(iVar2, &stack)`. Logs `"Coop_Fenrir_Loading"`.
+- `FUN_103a9ea0(container)` = find the ACTIVE netplay session: `container` is the object at `DAT_12804acc+0x68`; its session array is `container+0x8`, count `container+0xC` (a cached cursor `DAT_1217a7e8` speeds the scan); for each element `e` it calls `e->vtable[+0x04]()` -> an info struct; the element is active when `info+0x4 > 3` **and** `info+0x14 == FUN_103a9c70()+0x14`. `FUN_103a9c70()` returns a lazy-initialized service singleton (`&DAT_128611f8`, init via `FUN_1025f040`, tagged "CFCXMusicService") - the comparison is a session-vs-service identity match.
+- `FUN_111854f0(sessionMgr, hostId, memberId)` = sets up the co-op session on the session-manager singleton (touches `+0x800=hostId`, `+0x340` current host with a `vtable+0x14c` check via `DAT_12805200`, `+0x348` member list built via `FUN_1146ad50` and virtual adders at `(+0x348)->vtable+0x74`).
+- `FUN_110252d0(game, out)` = reads the **co-op game object's player roster**: `+0x50`/`+0x54` = two player-slot indices (`-1` = empty), `+0x70` = player array (stride `0x1c`), `+0x74` = count; per slot it resolves the player and calls `FUN_10041e00` (a player-present predicate) and returns 1 when a slot resolves. This object is a populated multiplayer game, not a local stub.
+
+### Where the session container is created
+`DAT_12804acc+0x68` has exactly ONE writer: **`FUN_10044000`**. It obtains an object from a
+factory/pool (`FUN_1177f7c0()` when `DAT_12162beb` is set, else `FUN_118db560()`); if the factory
+returns null it writes `0` to the slot and returns; otherwise it sets the object's vtable to
+`&PTR_FUN_11f3b260`, zero-inits its fields (`+0x4=0`, `+0xC=0`, `+0x14=0`) and sets `+0x10=5000`,
+runs two sub-inits (`FUN_106bee30`, `FUN_106bf2e0`), and installs the object into `DAT_12804acc+0x68`.
+So the session **provider/manager** exists from boot (guarded by a factory that can fail), and
+`FUN_103a9ea0` reads its session array/count. The session **entries**, the co-op **game object**, the
+co-op **session-manager** member slots, and the `FUN_103a2d50` **hashmap** entries are all filled in
+by the **netplay join handshake**, not by any offline/menu code.
+
+### Live confirmation (offline `farcry3.exe`, DX9, my own direct launch)
+Added read-only RPCs to `scripts/fc3_h3_trace.js` + commands to `scripts/fc3_h3_run.py`:
+`sessions`/`sess` (dump the container array/count) and the earlier `netgate`. Offline the
+availability byte `DAT_12804acc+0x6c == 1` (open), but the session list reads as garbage/unset
+(array pointer `0x2f`), consistent with **no session entries offline**.
+
+### Verdict (answers the owner's question)
+- The object the loader consumes is a **netplay session / multiplayer game object**, reached only
+  through the session provider at `DAT_12804acc+0x68` (vtable `PTR_FUN_11f3b260`) and the
+  `FUN_103a2d50` hashmap; a real one must carry a session with `info+0x4 > 3`, a matching service
+  identity, a co-op kind (`DAT_1216ca90`/`DAT_1216ca9c`), valid host/member ids (`!= -1`), and a
+  game object with populated `0x1c`-stride player slots.
+- Its container is built at boot by `FUN_10044000`, but **the sessions themselves are created only
+  by the netplay join path**. There is **no local/menu/adder that inserts a session offline**.
+- Therefore the session object **cannot be meaningfully pre-filled offline** by writing ids/fields:
+  the loader's real dispatch is hard-gated on a live netplay session + hashmap entry. Offline
+  4-player co-op entry via id/field manipulation is **not** sufficient. The next real advance is in
+  the **netplay layer** (what populates the provider's session array at join), i.e. the
+  fake-world / emulated-local-server route from the hub playbook, not more mode-field poking.
+
+Ghidra 12.1.4 java gotchas hit again: `getFunctionContaining` needs `currentProgram.getFunctionManager().getFunctionContaining` unless a wildcard `ghidra.program.model.symbol.*` import is present; never call `Long.toHexString` on `Function.getEntryPoint()` (it returns `Address`, not `Long`) - use `Address.toString()`.
+
+## Session 10 (2026-11-09): two community co-op mods acquired, vanilla 1.05 rolled out, first byte-diffs (agent session)
+
+Owner prompt (2026-11-09): in `H:\FarCryCoop\Downloads` the owner placed two different co-op mods -
+`FarCry 3-OpenWorldCo-op(Patch1.5)` (Nexus mod 220) and `patch_solo_offline_coop_vanilla-262`
+(Nexus mod 262) - plus a `FarCry3-1.05` folder (files to downgrade 1.06 -> 1.05). Asked to (a) roll
+out a SEPARATE 1.05 version from the TestFC3 copy, and (b) continue the research using the mods'
+experience + our findings + my proposals.
+
+### Vanilla 1.05 install built (separate, non-destructive)
+
+- Built `H:\FarCryCoop\TestFC3_105` as a **separate 1.05 install** from the 1.06 working copy,
+  preserving TestFC3 (1.06) for our Frida work. Method (background `robocopy`, log
+  `H:\FarCryCoop\scratch\downgrade_105.log`): copy TestFC3 -> TestFC3_105 with `/E /XD bin`, then
+  `robocopy H:\FarCryCoop\Downloads\FarCry3-1.05\Bin TestFC3_105\bin /MIR` (bin mirrored to 1.05,
+  removing the 1.06-only `upc_r1_loader.dll`). The 1.06 game data (`data_win32\patch.dat`
+  `5a788dd5f7be`, 202 MB) is kept unchanged - the 1.05->1.06 update is Bin-only.
+- Verified clean vanilla 1.05 in TestFC3_105\bin: `farcry3.exe` md5 `3cf63ffd73d7`,
+  `farcry3_d3d11.exe` `df7fc8a341ce`, `FC3.dll` `5ff045331557` (29,994,856 B),
+  `FC3_d3d11.dll` `46bcc0975905` (30,057,832 B), `uplay_r1_loader.dll` `8313de5eb4f4`,
+  `ubiorbitapi_r2_loader.dll` `ba6015e566c9`. 19 bin files. `upc_r1_loader.dll` (1.06) gone.
+- NOTE: 1.06 `FC3.dll` is 40,720,424 B vs 1.05 29,994,856 B - a substantially different binary, so
+  our 1.06 Ghidra map (session 8/9) does NOT transfer directly; a Ghidra `FC3_105` project must be
+  built to analyze the 1.05 binaries/mods.
+
+### The two mods - what they are (from their READMEs + binary hashes)
+
+- **solo_offline_coop (mod 262, v1.01, "based on version 1.05v2"):** lets a solo player start and
+  play **alone in Co-op game mode** (Private Session, Public Session, and after update 1.01 also
+  Local Session), offline, DX9 & DX11. Installs by replacing `bin\FC3.dll` + `FC3_d3d11.dll`
+  (backup originals) and needs "The Dependencies" = `ubiorbitapi_r2_loader.dll` +
+  `uplay_r1_loader.dll` in bin and `uplay_r14.dll` in the Ubisoft Connect dir. LAN play = No. Other
+  clients CAN still join. Default loadout only. The author states the co-op mode "relied on a
+  specific file that only [is] in [a] legitIMATE copy of the game even [when] the mod only run[s] in
+  offline mode" - i.e. the orbit/Uplay session components.
+- **OpenWorldCo-op (mod 220, Patch 1.5):** a full open-world co-op total conversion. Install = copy
+  the whole "Far Cry 3" folder (bin FC3.dll + `data_win32\patch.dat/patch.fat`, 3.38 GB) over the
+  game. Single player + vanilla co-op maps are unavailable while installed. To play: create a
+  **private co-op session from the main menu** and set the chapter to **"ROOK ISLANDS" / "fc3_main"**.
+
+### Where the co-op patch actually lives (binary hash comparison)
+
+- `FC3.dll` md5: vanilla 1.05 `5ff045331557`; **solo262 `5ff045331557` = IDENTICAL to vanilla** (solo
+  does NOT patch FC3.dll); **OpenWorld220 `927a1a30c51d` = patched 1.05** (same size, in-place edits).
+- `FC3_d3d11.dll`: vanilla `46bcc0975905`; solo262 identical; OpenWorld220 `07abaf666a6d` patched.
+- `uplay_r1_loader.dll`: vanilla 1.05 `8313de5eb4f4`; **BOTH mods `dacd14c07775`** (same size 294,400).
+  Byte-diff (`H:\FarCryCoop\scratch\loader_uplay_r1_diff.txt`): differs by **exactly ONE byte** at
+  file offset `0x3B030` (`00` -> `34` = ASCII '4'), immediately before the export-name strings
+  `UPLAY_Init` / `UPLAY_Startup...`. So the loader shim is a thin hook loader; the real offline co-op
+  emulator is **`uplay_r14.dll`** (4,808,512 B, md5 `6c75cb01cef6`), shipped in the mod root and NOT
+  present in the vanilla 1.05 Bin nor in TestFC3 - it must be a Uplay-API shim that fakes the co-op
+  session so the game runs co-op offline. **This file is the primary next RE target.**
+- `ubiorbitapi_r2_loader.dll` is byte-identical to vanilla in all sets (`ba6015e566c9`) - it is just
+  the legit "dependency", not patched.
+
+### OpenWorldCo-op FC3.dll patch map (diff vanilla 1.05 vs OpenWorld220, file offsets)
+
+Full diff: `H:\FarCryCoop\scratch\fc3_openworld_vs_105_diff.txt` (100 differing bytes, 27 runs). The
+material changes:
+- **Map/chapter override at `0x15345D0`:** the co-op session's default map string
+  `mpdlc1_aegir` (vanilla co-op DLC map) is replaced with **`fc3_main`** (the single-player open
+  world). This is the core of the mod - co-op runs on the campaign world (matches readme "fc3_main").
+- **Two NOP-5 -> CALL hooks** (code injection into existing flow): at `0x8C406B`
+  `90 90 90 90 90` -> `e8 99 fe ff ff` (call rel -0x167) and at `0x8C5036` `90*5` ->
+  `e8 ce ee ff ff` (call rel -0x1332). These sit in 5-byte padding inside functions (prologue
+  `55 8b ec` follows) and redirect into existing routines - the engine-level co-op injections.
+- **~20 float tuning constants** (matches the changelog "Reduced entity streaming radius",
+  "Decreased AI health"): e.g. `0x15343B0` (64 B block of doubles/floats), `0x14F2A30`, `0x1535D59`,
+  `0x155239C`, `0x1552618`, `0x1552AB8` (spawn/stream/radius values rewritten).
+- **A batch of first-char string corruptions `F`/`C` -> `X`** (`FOV`->`XOV`, `Coop`->`Xoop`,
+  `CRadio`->`XRadio` at `0x151BFAD`, `0x15D6620`, `0x1569A18`, ...): the modder renamed resource/UI
+  strings so certain features/asset lookups fail - used to disable vanilla co-op-only UI/features.
+
+### Strategic read / next steps
+
+Both mods prove offline co-op on **1.05** is achievable: solo262 entirely at the **loader-shim layer**
+(`uplay_r14.dll` fakes the session, FC3.dll untouched), OpenWorld220 additionally with **engine
+patches** (`fc3_main` map override + NOP->CALL hooks + tuning). Our 1.06 netplay-session-object
+blocker (session 9) is exactly what `uplay_r14.dll` sidesteps. Next: (1) build a Ghidra `FC3_105`
+project and locate the `mpdlc1_aegir`/session-string and loader call sites; (2) reverse
+`uplay_r14.dll` (the offline co-op emulator) to see which Uplay/orbit session APIs it stubs; (3)
+verify by launching `TestFC3_105\bin\farcry3.exe` (offline direct, our known method) optionally with
+the solo262 loader set to reproduce solo-offline co-op, then design the 4-player extension.
+All paths offline / working copies only (AGENTS golden rule 2).
+
+
+## Session 11 (2026-11-09): the 1.05 install boots offline; the solo262 loader set swaps in cleanly
+
+Goal: verify the new vanilla 1.05 working copy `H:\FarCryCoop\TestFC3_105\bin\farcry3.exe`
+launches offline by the direct method (`DETACHED_PROCESS` 0x8, cwd = `bin`), then temporarily
+install the `patch_solo_offline_coop_vanilla-262` loader set and check the game still boots,
+to prepare a reproduction of solo-offline co-op. Backups first; offline only; TestFC3_105 only.
+
+Backups: `H:\FarCryCoop\TestFC3_105\bin_backup_vanilla105\` holds the five original files
+(`FC3.dll`, `FC3_d3d11.dll`, `uplay_r1_loader.dll`, `ubiorbitapi_r2_loader.dll`, `farcry3.exe`);
+restore by copying them back over `bin\`.
+
+Test harness: `H:\FarCryCoop\scratch\fc3_win.py <tag> <bindir> [keep]` (kill any running
+`farcry3.exe`, launch DETACHED with cwd=bin, poll every 5s for 50s for a visible top-level
+window whose title contains "Far Cry" and whose size >= 120x120, optional screenshot, then kill
+unless `keep`). A PowerShell screenshot helper `H:\FarCryCoop\scratch\shot.ps1` (System.Drawing)
+is used because Pillow is not installed.
+
+### Finding A — vanilla 1.05 boots offline (direct method)
+
+`farcry3.exe` is a small launcher stub: the process we spawn exits with rc=0 within ~5s, but it
+re-execs the real game as a sibling process. A `Far Cry(R) 3` 1920x1080 window is present from
+~10s to 50s+ (confirmed by window enumeration), with the process still alive at 50s. Six
+`UplayWebCore.exe` helper processes are running (the Ubisoft Connect web core). Conclusion: the
+1.05 build does launch offline to its main window; the earlier 1.06 finding "no window, exited
+rc=0" was a harness artifact of tracking the wrong (stub) PID. So our direct-launch method works
+on the 1.05 copy.
+
+### Finding B — the solo262 loader set installs and the game still boots
+
+Installed into `TestFC3_105\bin`: `uplay_r1_loader.dll` -> patched md5 `dacd14c07775` (from
+`Far Cry 3\bin\uplay_r1_loader.dll`) and `uplay_r14.dll` md5 `6c75cb01cef6` (4808512 B, the solo
+co-op emulator, from the mod root). The other two bin loaders are already correct
+(`ubiorbitapi_r2_loader.dll` = `ba6015e566c9`, identical to the mod's dependency pack); `FC3.dll`
+and `FC3_d3d11.dll` were left vanilla because the solo mod does not patch them. With those two
+files in place, `farcry3.exe` again boots to the `Far Cry(R) 3` 1920x1080 window and stays alive
+at least 50s — the loader swap does not break startup. `uplay_r14.dll` is normally copied next to
+the Ubisoft Connect launcher per the mod README; placing it in the game `bin` works for the
+direct-launch path (DLL search order). Note the loader swap is still temporary; vanilla is
+restorable from `bin_backup_vanilla105`.
+
+### Not yet verified — entering the solo co-op session
+
+Whether the in-game menu now leads into a solo co-op session (Play -> Co-op -> Private Session ->
+Start) is a manual menu action that cannot be driven from the harness (fullscreen, no PIL, cannot
+reliably send input to a fullscreen exclusive game without disturbing the owner's live desktop).
+The loader boot + process stability are green; the actual session entry needs one manual run on
+the owner's screen. This is the immediate next step for the reproduction and it is owner-side.
+
+
+### Session 13 (2026-11-09, agent) — offline launch mechanism, junction, and the full solo262 install on the 1.05 copy
+
+Purpose: get the working copy to actually run and reproduce the solo-offline co-op of the mod `patch_solo_offline_coop_vanilla-262` (nexus 262), which the earlier sessions could not launch. The owner authorised both the C:-drive write and the 1.05 downgrade ("Разрешаю оба шага", 2026-11-09).
+
+Why the copy "never ran" (root cause, confirmed by Frida): `bin\farcry3.exe` (203,816 bytes) and `farcry3_d3d11.exe` are Ubisoft Connect **stub launchers**, not the game. The real engine is `FC3.dll`, loaded by `uplay_r1.dll` / `upc_r1_loader.dll` under the live Ubisoft Connect process (`C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\upc.exe`). A direct `Popen` of the copy's stub boots the **real** install because the launcher selects the game by its own database (InstallDir registry key is read only by `FC3Updater.exe`, not by upc), and a registry repoint (even elevated) did **not** change the launched path.
+
+Junction method (the one that works, and is reversible): point `H:\Uplay\Far Cry 3` at the copy with an NTFS junction, so upc's Play button launches the copy while the launcher still sees the registered path. Scripts (`H:\FarCryCoop\scratch\`): `use_copy_junction.bat` (admin; kills game/launcher; `ren` real dir to `Far Cry 3.OFFICIAL` — metadata only, no data moved; `mklink /J "H:\Uplay\Far Cry 3" "H:\FarCryCoop\TestFC3_105"`), `undo_junction.bat` (guards with `fsutil reparsepoint query`, `rmdir` the link only, never the target, renames back). Verified: after the junction + upc Play, the live `farcry3.exe` main module path = `H:\FarCryCoop\TestFC3_105\bin\farcry3.exe`.
+
+Solo262 needs 1.05, not 1.06: on 1.06 `farcry3.exe` loads `uplay_r1.dll` directly and never loads the `bin` shim `uplay_r1_loader.dll`, so `uplay_r14.dll` is never reached (the mod README says "the latest version removed these files"). Final install state of `H:\FarCryCoop\TestFC3_105` (all md5-verified against the mod package): `bin\FC3.dll` 5ff045331557, `bin\FC3_d3d11.dll` 46bcc0975905, `bin\uplay_r1_loader.dll` dacd14c07775, `bin\ubiorbitapi_r2_loader.dll` ba6015e566c9, `bin\uplay_r14.dll` 6c75cb01cef6, `data_win32\patch.dat` 212,002,032 bytes (md5 157f2d7682a5, source==dest; the 8797f53343a3 quoted earlier was a sha256[:16], not md5), `data_win32\patch.fat` md5 850412635760. The C: step — `uplay_r14.dll` (6c75cb01cef6) into the launcher dir — needs Administrator (a direct copy returns PermissionError 13); the launcher dir otherwise holds `uplay_r1.dll` 577501e23fa4 etc. and had **no** `uplay_r14.dll`, so adding it is purely additive. Scripts: `install_uplay_r14_launcher.bat` (admin, additive copy, rollback = delete that file) and `uninstall_solo262.bat` (admin; deletes the C: file + the 3 bin dependency DLLs and restores `FC3.dll`/`FC3_d3d11.dll`/`patch.dat`/`patch.fat` from `TestFC3_105\_backup_106_before_solo262\` — the pre-mod 1.06 backup, md5s FC3 5742de2aaa76, FC3_d3d11 916c6d4b876d, patch.dat 5a788dd5f7be, patch.fat c829e677c352).
+
+`uplay_r14.dll` recon (offline Ghidra, project `FC3_uplayr14`, `DumpImportsExports.java` → `out\uplayr14_imports.txt`, 505 strings matched): it is a **complete in-process Uplay/orbit SDK emulator** — the embedded Jenkins paths are `...\client\products\uplay_r1\src\Uplay\*.cpp` and it exports the whole UPLAY_* surface the game imports: `UPLAY_Startup/Start/Init`, `UPLAY_USER_GetTicketUtf8/GetProfile/SetGameSession/ClearGameSession`, `UPLAY_FRIENDS_*` (IsFriend/GetFriendList/InviteToGame… "InviteToGame: Game session must be set before inviting to game"), `UPLAY_CHAT_Init`, `UPLAY_PARTY_Init`, `UPLAY_SetGameSession`, plus IPC-pipe names `uplay_ipc_pipe_`, `uplay_api_process_ipc_pipe_`, `orbit_orbit_pipe_name`. Verdict: this DLL replaces the Ubisoft backend with a local fake platform (pipes + stubs), which is exactly the "emulate the netplay layer" step the offline H4b verdict (session 9) pointed to. The game's co-op session object is fed by these UPLAY_* calls; for solo the emulator returns a self-only session. Extending this to four real peers is the project's real target (netplay layer, hub `fake-world-testing`/`networking`). Live test procedure is in `docs/solo-coop-test.md` / `docs/solo-coop-test.ru.md`.
+
+
+### Session 13b (2026-11-09, agent) — MILESTONE: solo offline co-op confirmed working on the copy
+
+The owner ran the admin step (`install_uplay_r14_launcher.bat` -> `uplay_r14.dll` into the Ubisoft Connect launcher dir), launched through Ubisoft Connect via the junction, and reported verbatim (2026-11-09): "ЗАпустил соло кооп он работает". So the full offline solo co-op path is now reproduced end-to-end on `H:\FarCryCoop\TestFC3_105` (1.05 + solo262 loader set), confirming the session-13 install and the session-11/13 launch mechanism (stub launcher -> junction -> upc Play -> `uplay_r1_loader.dll` -> `uplay_r14.dll` fake Uplay/orbit platform).
+
+Meaning for the campaign-co-op goal: the offline co-op path is proven; the remaining gap to 4-player **campaign** co-op is now precisely (a) the map: solo262 runs the stock co-op map (it does not patch `mpdlc1_aegir`->`fc3_main` the way OpenWorld220 does), and (b) real peers: `uplay_r14.dll` returns a self-only session, so friends cannot join; extending that emulator to broker multiple real peers is the concrete next work (netplay layer, hub `fake-world-testing`/`networking`). PLAN critical path H6 step 3 is DONE.
+
+
+### Session 14 (2026-11-09, agent) — H7a: co-op map selector found and patched to the campaign world
+
+Goal: make a co-op session load the single-player campaign world instead of the stock co-op island, by the same one-string change the community mod OpenWorld220 makes. Offline scan of our vanilla 1.05 `FC3.dll` (`H:\FarCryCoop\TestFC3_105\bin\FC3.dll`, md5 `5ff045331557…`, 29,994,856 bytes) confirmed the co-op startup world string `mpdlc1_aegir` sits at **file offset `0x15345D0`** — exactly the offset OpenWorld220's diff showed. Surrounding bytes: `mpdlc1_aegir` (12 chars) + 6 null bytes, then `80 40` (numeric) and the `NetObject` string, so the name field is 12 wide and null-terminated. A second, unrelated co-op string `mpdlc1_idun` is at `0x15A2568` (part of a "Loading / COOP_Sleipner" list) — left untouched. Campaign world id `fc3_main` also appears in 8 other places (e.g. `worlds/fc3_main/fc3_main.dat`) but the selector used by co-op startup is `0x15345D0`.
+
+Patch: overwrite the 12 bytes at `0x15345D0` with `fc3_main\0\0\0\0` (same width, cleanly null-terminated). Wrote tool `scripts/h7a_coopmap_patch.py` (subcommands `status`/`apply`/`restore`; `apply` writes in-place backup `FC3.dll.bak_h7a` and kills the game first; `restore` reverts). Applied it to the copy: FC3.dll md5 `5ff045331557…` -> `e4516487fd07…`; byte-diff vs backup is **exactly 12 bytes** (`0x15345D0..0x15345DB`), file size unchanged, `mpdlc1_idun` intact. Rollback: `python -I scripts\h7a_coopmap_patch.py restore`.
+
+Open question for the live test: the copy's `data_win32` is solo262's `patch.dat` (212 MB, vanilla-based), which contains the base campaign world assets, so `fc3_main` should be loadable; but co-op spawn/missions inside the campaign world are not guaranteed (OpenWorld220 ships its own 3.38 GB `data_win32` and instructs setting the co-op chapter to "ROOK ISLANDS"/`fc3_main`). Next = owner launches the copy and enters solo co-op to see whether the campaign world loads. If it breaks the previously-working island solo, `restore` returns it. This is a single-player step (still solo); real peers remain H7b.
+
+
+### Session 15 (2026-11-09, agent) — H7a refined: co-op loads a "coop mission" not the open world; OpenWorld 1.5 installed
+
+Result of the H7a one-string patch live test (owner): co-op did NOT load the open campaign island; a stock **co-op mission** launched instead. Diagnosis: the vanilla co-op flow is mission-based; flipping only the world string `mpdlc1_aegir`->`fc3_main` at `0x15345D0` is not enough — the open-world co-op needs the full patched FC3.dll (the two `NOP5->CALL` hooks at `0x8C406B`/`0x8C5036` and ~20 tuning float constants that the community mod ships), plus a modded `fc3_main_vistas.dat`.
+
+Data check: our copy ALREADY carries the full campaign world (`worlds\fc3_main\fc3_main.dat` 3.49 GB + all 7 language `.dat` + a stock `fc3_main_vistas.dat` 152 MB) and `multicommon` — so the campaign terrain/objects are present; what was missing was the **open-world co-op vistas** (the mod ships a 3.06 GB `fc3_main_vistas.dat`) and the patched FC3.dll logic. Conclusion: the H7a string-patch is the map *selector* but the open-world *behaviour* is the mod's patched FC3.dll + vistas, i.e. the OpenWorld mod, not a one-byte edit.
+
+Action (owner authorised adding these files): installed OpenWorld Co-op Patch 1.5 (`H:\FarCryCoop\Downloads\FarCry 3-OpenWorldCo-op(Patch1.5)`, nexus 220) over the junctioned test-bed copy `H:\FarCryCoop\TestFC3_105` via `H:\FarCryCoop\scratch\install_openworld.py`. Files laid down (md5 after -> before):
+- `bin\FC3.dll` `e4516487…`(h7a hand-patch) -> `927a1a30c51d` (mod open-world build)
+- `bin\FC3_d3d11.dll` `46bcc097…` -> `07abaf666a6d`
+- `bin\uplay_r1_loader.dll` `dacd14c07775`, `bin\ubiorbitapi_r2_loader.dll` `ba6015e566c9` (unchanged — identical to solo262's; OpenWorld 1.5 bundles the same offline co-op loader)
+- `data_win32\patch.dat` `96f74843…` -> `90482fbeee7e` (192 MB mod), `patch.fat` `850412635760` -> `2bae1147067d`
+- `data_win32\worlds\fc3_main\fc3_main_vistas.dat` `87151f18…`(152 MB stock) -> `cb5da2c2d18c` (3.06 GB mod open-world vistas), `fc3_main_vistas.fat` `a6ebc6e7` -> `858bf128a3c6`
+
+Backups of every overwritten file in `H:\FarCryCoop\scratch\backup_pre_openworld\` with `manifest.json` (bin FC3/FC3_d3d11/loaders, patch.dat `157f2d76`, vistas `87151f18`). Rollback: copy those back (or `h7a_coopmap_patch.py restore` only reverts the string-patched FC3.dll, not vistas/patch.dat). `uplay_r14.dll` stays in the launcher dir (C:) — still the offline session enabler the mod's loader needs. The mod README warns SP and vanilla co-op are unplayable while installed (fine — dedicated test bed).
+
+Next: owner launches via upc (junctioned copy) -> main menu -> create a **PRIVATE co-op session** -> set the chapter to **ROOK ISLANDS / fc3_main**, and reports whether the open campaign world loads. This is still single-player solo (H7a); real peers remain H7b.
+
+### Session 16 (2026-11-09, agent) — OpenWorld 1.5 live test failed as predicted; reverted to the working offline-solo-coop (island) baseline; H7b becomes the critical path
+
+Live test of the OpenWorld 1.5 install (session 15) by the owner: after the intro the co-op did NOT load the open campaign island. Instead the stock co-op browser/mission flow appeared, and the solo/offline path did not expose the "ROOK ISLANDS" chapter choice (which the mod README describes) — pressing co-op went straight into the intro. Diagnosis (confirms the session-15 strategy note): OpenWorld Co-op is a **retail-1.05 total conversion** (its README requires replacing the entire `Far Cry 3` folder including `data_win32`), and it is an **online co-op** mod for real Uplay friends. It therefore (a) cannot be made to work by dropping `patch.dat` + vistas + `FC3.dll` onto our **1.06-base** junction copy (the 3.06 GB open-world vistas try to stream against a mismatched 1.06 `fc3_main.dat`, so the big world hangs), and (b) the chapter-select slider it mentions belongs to the **online** co-op session browser, which the offline/solo (`uplay_r14`) path does not offer. Net: OpenWorld is **orthogonal** to our 4-player offline goal — it is single/online campaign co-op, not a 4-player offline enabler.
+
+Revert executed by the agent (owner was at the console; reversible file ops on `H:` only, backups intact, repo files untouched). Restored the pre-OpenWorld baseline from `H:\FarCryCoop\scratch\backup_pre_openworld\` into `H:\FarCryCoop\TestFC3_105`:
+- `bin\FC3.dll` -> `e4516487fd07` (the H7a string-patched 1.05 that loads the island co-op), `bin\FC3_d3d11.dll` -> `46bcc0975905` (vanilla 1.05).
+- `data_win32\patch.dat` -> size 212002032 (pre-OpenWorld), `patch.fat` restored.
+- `data_win32\worlds\fc3_main\fc3_main_vistas.dat` -> **152925506 (the stock 1.06 vista, 152 MB)**; the OpenWorld mod vista had replaced it with ~3.06 GB. Vista path inside the copy is `data_win32\worlds\fc3_main\fc3_main_vistas.dat` (not a top-level `worlds\`). `fc3_main_vistas.fat` restored.
+- solo262 loaders in `bin` (`uplay_r1_loader.dll` `dacd14c07775`, `ubiorbitapi_r2_loader.dll` `ba6015e566c9`) and `uplay_r14.dll` (C: launcher dir + copy bin) left in place — they are the working offline-coop enabler.
+
+So `TestFC3_105` is back to: **1.06 base + solo262 offline-coop loaders + island**, i.e. the session-13b milestone. Owner relaunched and confirmed (2026-11-09): "Перезапустил игру после откатa — островной соло-кооп снова заводится как раньше." Offline solo co-op on the island is reproduced again.
+
+Decision: deprioritize the "campaign world via OpenWorld" line — to actually test the OpenWorld open world one would need a **genuine full 1.05 install** as the base (available at `H:\FarCryCoop\Downloads\FarCry3-1.05`: 1.05 `bin` + 34 GB data, `fc3_main.dat` = 1.05 `5879957b`, `patch.dat` 212002032), which is a separate large experiment and still single/online co-op. The real path to the project's goal (4-player offline campaign co-op) is **H7b**: on this same island, where offline co-op already boots, extend the `uplay_r14.dll` Uplay/orbit emulator (its `UPLAY_USER_SetGameSession`, `UPLAY_FRIENDS_*`, `UPLAY_CHAT/PARTY_Init`, local IPC pipes `uplay_ipc_pipe_`/`uplay_api_process_ipc_pipe_`) so it brokers multiple real local peers instead of a self-only session (per hub `fake-world-testing`/`networking`). Next: begin H7b — map the `uplay_r14` session/FRIENDS/IPC surface to see where a second peer joins.
+
+### Sessions 17–18 (2026-11-09, agent) — H7b multi-peer attempts (OpenWorld is online-only)
+
+H7b (a real second peer in offline co-op) was probed by installing the **OpenWorld Co-op 1.5** mod and by reading its design. Conclusion: OpenWorld is a **retail-1.05 total-conversion online co-op** mod for real Uplay friends — it is single/online campaign co-op, orthogonal to our 4-player offline goal. No offline multi-peer path was found there. (Full detail in project memory.)
+
+### Session 19 (2026-11-09, agent) — offline co-op loads one of **9 fixed missions**; the island is not a startup world
+
+- **Offline co-op = the stock 2-player DLC mission set, hardcoded.** The 9 selectable co-op levels (`coop_freyja / coop_loki / coop_idun / coop_sifr / coop_aldrið / coop_vidar / coop_natti / coop_einbyi / coop_aegir`) are defined by a **static array of 9 fixed `char[24]` name strings** in FC3.dll (found in FC3.dll 1.06 = solo262 at `.rdata` `0x1860920`..`0x1860A50`). `FUN_10042060` reads `session+0x54` (a session slot **index**, not a world id) and looks the name up by string in this table via `FUN_10039e10`. The loader `FUN_113400f0` consumes `session+0x10` (the current world string) as the world to load. There is **no** data-driven co-op level *picker* table in FC3.dll — the 9 names are a fixed pool; the 5 DLC ones (`coop_aldrið/natti/einbyi/vidar/aegir`) resolve from `patch.dat` DLC, the 4 (`freyja/loki/sifr/idun`) from `common.dat`.
+- **The island (`fc3_main`) is NOT in that pool** → offline co-op cannot start there. `fc3_main` appears 60× in `patch.dat` (a normal SP world) but is absent from the co-op startup table. The "chapter → ROOK ISLANDS" the OpenWorld README describes is its own custom online-coop feature (its FC3.dll), **not** a solo262 option.
+- **The offline-solo-menu regression cause is `patch.dat`.** Bisect of "main menu won't load with the hybrid": the offline-solo menu requires the **SOLO262 patch.dat** (212 002 032 B); the OpenWorld patch.dat (207 817 304 B) forces the game online and hangs the menu, even though uplay_r14 reports "NetworkManager initialized successfully". FC3.dll is irrelevant to the hang (solo patch.dat + H7a/OpenWorld FC3.dll both boot). So the two failure modes are disjoint: **patch.dat → offline menu; FC3.dll+depload → island world.**
+- **H7a (the island string-patch)**: in FC3.dll the co-op startup world is read from a fixed string slot (`0x1860a80`, `mov ecx,imm32;call FUN_113400f0`; the 24-byte string at `0x1860aa8`). Patching `"coop_freyja"→"fc3_main"` makes the loader request `fc3_main` — it loads to 83 % and the game enters a **playable state (time-of-day cycle runs)**, but it is **not a rendered open world** (a mission intro/wave overlay, not the island). So H7a = playable-state boot only, not the real island.
+
+### Session 20 (2026-11-09, agent) — `patch.dat` tooling (Gibbed.Dunia2) + diff; the real critical path is the **session host layer**
+
+- Owner supplied the **Gibbed.Dunia2** toolset at `H:\FarCryCoop\Downloads\dunia2-r178_b113` (github.com/gibbed/Gibbed.Dunia2). `bin\Gibbed.Dunia2.Unpack.exe --ns -v <patch.fat> <out>` runs on this PC (.NET ok); `Pack.exe` repacks; `ConvertBinaryObject.exe` does bobj↔xml; LZO via `lzo_32/64.dll`. `patch.dat/.fat` = Ubisoft "Domino" big-file (magic `-- {\v/} Domino `). Unpacked both: solo → `scratch\patch_top` (431 files), OpenWorld → `scratch\patch_ow_top` (3316 files).
+- **Diff (OpenWorld vs solo)**: +2910 OpenWorld-only files (mostly `__unknown\game\*.fcb`, `__unknown\scripts\*.lua`, `__unknown\gfx\*.xbt`, `__unknown\misc\*.profile.xml`). Changed: `worlds\fc3_main\generated\fc3_main_depload.dat` **1 353 370 → 2 923 685 B** (OpenWorld nearly doubles the island dep-load = the island's co-op entities, PRIME island-registration suspect); `generated\nomadobjecttemplates.fcb` 2.6 MB → 1.04 MB; all `domino\library\sp\lib_defend.outpost_{easy,med,hard,nowave}_core2_*.lua` shrink ~46–60 KB → ~18 161 B (the co-op mission objective libs rewritten); solo-only files include `ui\multiplayer\menu\multimain.feu` and the 136 MB `ui\multiplayer\video\fc3coopintro.bik` (OpenWorld ships its own / deletes them).
+- **KEY CONCLUSION — why OpenWorld is online-only is NOT a config file.** A keyword scan of all OpenWorld `__unknown\scripts` for `uplay/online/session/host/steam` is **empty**. OpenWorld forces online because island co-op runs through the game's **native multiplayer UPLAY-session HOST path**; `uplay_r14` fakes that session only far enough for a **solo/offline co-op mission**, not for hosting a real co-op game with peers. Therefore **island-with-friends (B) and second-peer (H7b) are the SAME problem**: make the fake offline session host a real co-op game. **The session-host layer is the single critical path.** Next: reverse the native co-op host → UPLAY session init (FC3.dll) and where `uplay_r14.dll` fakes it for solo, to find an offline-host hook point.
+
+## Session 22 (agent, 2026-11-09) — offline-host wall pinned to the Rv GameSession join
+
+Read-only Ghidra FC3_106 + loader-shim static trace (supermemory `Cz8Ja9zSjzAEGHfJi4K1xq`,
+`nvjxCfpQn79eavDMBirw1P`, `chzyBsC2o83CHAcLdYT3Uu`, `KcD1dL5WTEUN7f5fUd4hYA`; artifacts
+`H:\FarCryCoop\scratch\ghidra\out\party106\{strs.txt,deep.txt,final2.txt}`,
+`local\scratch\out\{fc3_party_glue.txt,fc3_rv_strings.txt}`).
+
+- Co-op hosting is the native Uplay party + RendezVous GameSession path. FC3's party controller
+  calls `UPLAY_PARTY_*` (1.05 RVAs; the 1.06 game-session anchor is `DAT_12805180`). The game
+  validates the **Rv GameSession participant list** (`E_SESSION_ERROR_RENDEZVOUS_GAMESESSION_*`:
+  `HOSTORPARTICIPANTREQUIRED`, `PARTICIPANTNOTCONNECTED`, `HOSTPRIVILEGEREQUIRED`,
+  `E_SESSION_ERROR_PARTY_NOT_HOST`), not only the Uplay member list.
+- Trusted co-op member list = provider's internal array, built by `FUN_11273650`: count at
+  `provider+0x38`, array base at `provider+0x3c`, each entry 0x20 bytes, member id at entry `+0x14`.
+  Join gate `FUN_11218480` counts against this same array. Provider getter `FUN_103660e0` returns the
+  provider only when party type `> 2` and party id `== DAT_1285fe3c`. Host/leader test is
+  `FUN_1006f990() == *(session + 0x120)`. `MaxPartySize` is a config var at config offset `0xa88`.
+- Verdict: faking the provider member array gives single-instance multi-slot (solo/testing/AI-like
+  extra slots). Two real humans offline still need the second instance to JOIN a live Rv GameSession
+  (`CJoinGameSessionParam` `FUN_10207af0`); no loopback/UDP Rv join found yet. That transport stays
+  the hard wall for island-with-friends / offline 2-4.
+
+### Session 22 addendum — transport verdict: the engine's co-op transport is service-bound (no offline join)
+
+Independent string/API scan of `uplay_r14.dll` 1.05 (`H:\FarCryCoop\TestFC3_105\bin`, 4,808,512 B) and a
+full Ghidra pass agree: **there is no LAN / broadcast / loopback / bind / listen / Winsock / p2p / relay
+transport in the game's own stack.** Details (artifacts `H:\FarCryCoop\scratch\ghidra\out\rvc2\*.txt`,
+`rv_transport.txt`, `uplayr14_strings_rv.txt`; supermemory `ry8sddUUPksVT5PKJv4FZs`):
+
+- `uplay_r14.dll` has no export table; FC3 binds it via `GetProcAddress("OrbitApi_InterfaceRequest")`.
+- All GameSession operations (`CreateSession`/`JoinSession`/`RegisterHost`/`SendChatMessage`/…) are vtable
+  slots of a `CGameSessionAPI` (slots 19/21/25/26/31/33/40/43/54 …), dispatched through FC3 thunks
+  (`RVCreateGameSession` @ 0x10cf6790, `RVJoinGameSession` @ 0x10cf6690, …).
+- Rv `SessionFactory.cpp` hard-asserts `!_multiplayer->IsStandalone()`; FC3 calls `RvInit` at
+  `FC3.exe+0x644879` — a standalone build fails the session factory.
+- The only connect primitive is `connectToNamedPipe` → the Orbit/Uplay service channel. No socket
+  connect, no listen. Sessions are service-bound.
+- Consequence: 'island with friends' / 'offline 2-4 real humans' is NOT reachable through the engine's
+  own transport. What the engine does support offline is single-instance multi-slot (fake the trusted
+  provider member array). A true second human needs an external transport (PLAN transport B): a custom
+  layer that reimplements the Rv `GameSession`/`CParty*NetMessage` handshake — a re-hosting effort, not
+  a patch. (Also corroborates the solo262 author's own "LAN: no".)
+
+### Session 22 addendum — transport verdict: the game's co-op transport is service-bound (no offline join)
+
+Independent string/API scan of `uplay_r14.dll` 1.05 (`H:\FarCryCoop\TestFC3_105\bin`, 4,808,512 B) and a
+full Ghidra deep-dive converge: **the network stack has NO LAN / broadcast / loopback / bind / listen /
+Winsock / p2p / relay primitive.** Artifacts `H:\FarCryCoop\scratch\ghidra\out\{rv_transport.txt,
+uplayr14_strings_rv.txt, uplayr14_apis.txt}`; supermemory `ry8sddUUPksVT5PKJv4FZs`.
+
+- `uplay_r14.dll` has **no export table**; FC3 binds it via `GetProcAddress("OrbitApi_InterfaceRequest")`.
+- All GameSession ops (`CreateSession`/`JoinSession`/`RegisterHost`/`SendChatMessage`/…) are vtable slots of
+  the `CGameSessionAPI` object (slots 19/21/25/26/31/33/40/43/54 …) called through FC3 thunks
+  (`RVCreateGameSession` @ 0x10cf6790, `RVJoinGameSession` @ 0x10cf6690, …).
+- Rv `SessionFactory.cpp` hard-asserts `!_multiplayer->IsStandalone()`; FC3 calls `RvInit` at
+  `FC3.exe+0x644879` — a standalone build kills the session factory.
+- The only connect primitive is `connectToNamedPipe` -> the Orbit/Uplay service channel. No socket connect,
+  no listen. Sessions are service-bound.
+- Consequence: island-with-friends / offline 2-4 real humans is NOT reachable through the engine's own
+  transport. The engine only supports single-instance multi-slot offline (fake the trusted provider member
+  array). Real 2-player co-op needs an EXTERNAL transport (PLAN transport B: reimplement the Rv GameSession
+  handshake + `CParty*NetMessage` in your own layer) — a netcode re-host, not a patch. Corroborates the
+  solo262 author's "LAN: no".
+
+
+## Session 23 (2026-11-10): FC3 LAN/loopback co-op discovery + command-line session launch = offline path found
+
+Goal (m03668 / m04365): island-with-friends AND offline 2-4 real humans. Read-only RE of FC3.dll 1.06
+offline Ghidra project `FC3_106`. This supersedes the Session 22 "infeasible via engine transport" verdict:
+that verdict only inspected `uplay_r14.dll` (the Orbit front-end), not the engine's own
+`storm::echo` netcode. Artifacts `H:\FarCryCoop\scratch\ghidra\out\coopnet\{cli_args.txt,lan_cfg.txt,
+session_msgs.txt,party_api.txt}`, `...\fc3sock\`, `...\party106\`; supermemory `cLjJUL76bobvfWw9AWxBPF`,
+`gpEXomdVhKJWD1TGf5ujJC`, `gX9Fyx5PTBWHhHjBfcGjZn`.
+
+- **The engine's own netcode is `storm::echo` (RendezVous), and it HAS a LAN + loopback matchmaking
+  layer.** Strings: `storm::echo::lan::BroadcastLanDiscovery2`, `storm::echo::lan::DiscoverSession`.
+- LAN config vars are registered (big init fn `FUN_111f6650` RVA 0x111f6650 via `FUN_11ab6ed0(name,ptr,
+  off,0x12)`): `LanMatchmakingReuseAddress` (name VA 0x11fb7210), `LanMatchmakingDiscoveryOnLoopbackEnable`
+  (name VA 0x11fb72e4; desc "Enable this option to discover sessions on the local machine only"),
+  `LanHostBroadcastPort` (name VA 0x11f1b2ac), `LanClientBroadcastPort` (name VA 0x11f1b2c4).
+- **Command-line session launch is first-class**, parsed in `InitDuniaEngine` @ 0x117a5750 (RVA 0x17a5750):
+  - `-dedicated` (LIT VA 0x11f0e7dc) + config var `dedicatedConfig` (`FUN_116feea0`; registered
+    `FUN_11ab6750("dedicatedConfig",0xc,0,3)`) = a headless dedicated host mode.
+  - coop/quickmatch launcher `FUN_11a8c440` (RVA 0x1a8c440) + `FUN_11a8c8b0` (RVA 0x1a8c8b0) parse via
+    strstr on the command line: `-coop` (LIT VA 0x11fb81fc), `-online` (LIT VA 0x11fb8234), `-ranked`
+    (sets a bool at launch-config +0x7e), `-sessionuid` (LIT VA 0x11fb81e4).
+  - `-client` mode REQUIRES `-login` AND `-ip` — error string "Missing -login or -ip for -client." So the
+    engine can launch as a **network client pointed straight at an arbitrary host IP**.
+  - `-offline` (LIT VA 0x11f37244 RVA 0x1f37244) read by `FUN_10fa07b0` (RVA 0xfa07b0): skips an online-only
+    session-localization op, and with `-donotloadfrontendworld` skips loading the online FRONTEND world.
+- **Architecture now clear**: FC3 imports the full Winsock set (43 funcs; `WSASocketA` @ 0x10abeb9b,
+  `WSASendTo` @ 0x10abed37, `WSARecvFrom` @ 0x10abef04 = the netcode UDP socket layer). Game data plane =
+  FC3's own UDP; `storm::echo` = LAN/loopback UDP with broadcast discovery + dedicated host + host
+  migration (`ObjectMigrationMode.SessionHostOnly`); `uplay_r14.dll` (Orbit) = ONLY the online
+  matchmaking / rendezvous / auth front-end (named-pipe `connectToNamedPipe`). The party layer FC3 uses
+  for in-game co-op is its own `CParty*` (Rv), not the Uplay Orbit party API.
+- **Rv GameSession param singletons** (verified in `party106/final3.txt` + `party106/strs.txt`, FC3_106):
+  `CJoinGameSessionParam` singleton getter `FUN_10207af0` (returns `&DAT_12859564`, init-flag
+  `DAT_12859560`), `CCreateGameSessionParam` `FUN_10208000` (→ `&DAT_12859464`/`DAT_12859460`; a caller is
+  `FUN_11956990` site 119569a3), `CDeleteGameSessionParam` `FUN_10207b90` (caller `FUN_11955f30`). These
+  singletons return a param object assembled into the Rv GameSession service. The **caller bodies of the
+  join/create param getters are NOT yet decompiled** (the headless `decompile_session_callers_106.py` runs
+  all failed: wrong project dir + PyGhidra; no `callers.txt` was produced). So the concrete host/join hook
+  points are still unverified. Correct approach for next pass: a Java Ghidra script under `-noanalysis`
+  (Jython/PyGhidra `currentProgram` does not bind in 12.1.4) or the REA MCP over the FC3_106 / FC3s105
+  projects. (Correction 2026-11-10: an earlier draft here named join-caller `FUN_1188ca20`; that address
+  has 0 occurrences in any real artifact and was erroneous.)
+- **Revised offline-2-4 plan (much lighter than a netcode re-host)**: the working solo262/1.05 mod already
+  boots FC3 into a co-op-ruleset session offline (loads the 9 scubrah missions). The remaining delta is
+  making a SECOND instance discover and connect to the first over the engine's OWN loopback LAN path:
+  set `LanMatchmakingDiscoveryOnLoopbackEnable=1`, `LanMatchmakingReuseAddress=1`,
+  `LanHostBroadcastPort`/`LanClientBroadcastPort`, and either use `-coop` / `-client -ip 127.0.0.1` or
+  detour the Rv GameSession create/join callers so they carry a loopback endpoint. This is a
+  **session-establishment shim** (matches PLAN Transport B), not a protocol rewrite.
+- **Two open blockers** (decide the shim shape):
+  1. Does `storm::echo` join enforce a service-minted `storm::echo::SessionTicket`
+     (`SessionTicketRequestAttachment`, `inEvent::RequestJoinSessionRefId`)? If the data plane accepts a
+     peer that never got a ticket, the shim only needs to fake discovery + roster; if it validates the
+     ticket, the shim must forge or stub the ticket path.
+  2. Is the `WSASendTo`/`WSARecvFrom` payload encrypted/signed (RC4/AES/HMAC/seed)? The 1.06 send site is
+     in FC3_106 (already analyzed); a string/xref pass on the send region + on the 1.05 `FC3s105` project
+     is the next probe. (No separate `FC3_105` headless build exists — that earlier note was erroneous;
+     the real 1.05 Ghidra project is `H:\FarCryCoop\ghidra_owcoop\FC3s105`.)
+
+
+### Session 24 — storm::echo ticket + LAN join handshake DECOMPILED (grounded, FC3_106 Java headless)
+
+Real output of the Java headless pass `CoopOfflineV2.java` (delegate `del_mw9rdojr_zz1x`, completed;
+artifacts `H:\FarCryCoop\scratch\ghidra\out\coop_offline_v1\{dumps.txt,dumps2.txt,rvjobs.txt}` and
+strings `out\coopnet\*`). This replaces the earlier unverified join-caller claims and answers blocker #1.
+
+- **S5 — the session ticket/join flow is a storm::echo in-process EVENT REGISTRY, all LAN-scoped** (each
+  handler registered via `FUN_1008c600("<event name>", id)`; the 36-byte `FUN_1070a910`-family funcs each
+  register one event):
+  - `storm::echo::session::inEvent::RequestTicketSessionRefId`
+  - `storm::echo::session::inEvent::AcceptTicketRequest`
+  - `storm::echo::session::inEvent::DistributeTicket`
+  - `storm::echo::session::inEvent::RefuseTicketRequest`
+  - `storm::echo::session::internal::inEvent::ReceiveTicketRequest`
+  - `storm::echo::session::internal::inEvent::ReceiveAcceptTicketRequest`
+  - `storm::echo::SessionTicketRequestAttachment`, `storm::echo::SessionTicket`
+  - `storm::echo::player::inEvent::RequestJoinSessionRefId`
+  - `storm::echo::lan::inEvent::DiscoverSession`
+  - `storm::echo::lan::inEvent::internal::BroadcastLanDiscovery2`
+- **Read of blocker #1 (SessionTicket): STRONG evidence the ticket is HOST-issued, not service-minted.**
+  The flow is a peer→host handshake carried on the LAN event channel: `DiscoverSession` →
+  `RequestJoinSessionRefId` → `RequestTicket` → host side `ReceiveTicketRequest` → `AcceptTicketRequest` →
+  `DistributeTicket`. There is no service/Orbit symbol in this path — the trust root is the host in
+  storm::echo, so the ticket path does **not** by itself require Ubisoft. (One confirmation pass pending:
+  read the `DistributeTicket`/`ReceiveTicketRequest` handler bodies to prove the host, not the relay, is
+  the trust root before calling it settled.)
+- **PRUDP confirmed** as the wire protocol: the socket pump `FUN_10ac3340` (size 865) drives send via
+  `FUN_10abec30` and receive via `FUN_10abedb0` (both take a socket-handle struct), and the transport is
+  tagged by the literal `prudp:/` (`FUN_10ad7190("prudp:/")`). PRUDP = Ubisoft's UDP reliability layer over
+  the raw Winsock layer (FC3sock), i.e. the data plane is PRUDP-over-UDP, not raw custom UDP.
+- **S4 result-handler vtables**: `createResultHandlerTable @ 0x11f57c14`, `joinResultHandlerTable @
+  0x11f56dac` — the per-result callback tables the GameSession service dispatches create/join outcomes
+  through; these are concrete detour surfaces for a session shim (better candidates than the singleton
+  getters).
+- **Netcode crypto (from the same run's `crypto_probe.py` over raw FC3.dll bytes)**: NO AES/SHA1/MD5/
+  SHA256/Blowfish/CRC32c signatures; only CRC32 tables (×10), xxhash32 primes (×27), TEA delta (×2).
+  Consistent with PRUDP (which uses XOR + Adler CRC integrity, not bulk cipher) → the payload is **not
+  bulk-encrypted**, but PRUDP still needs its connection handshake replicated. This reframes blocker #2:
+  the question is now "implement/be inside PRUDP", not "defeat AES".
+
+
+### Session 25 — engine LAN-matchmaking module EXISTS and is loopback-configurable, but the offline flow never drives it (decision on the transport path)
+
+LanTrace.java over the analysed FC3_106 (artifacts `H:\FarCryCoop\scratch\ghidra\out\lantrace\report.txt`;
+runner `H:\FarCryCoop\scratch\ghidra\run_lantrace2.bat`). Read the working copy's
+`scratch/exp_lan_config/engine/settings/defaultnetworkconfig.xml` (the live netconfig the engine parses):
+
+- The netcode config the engine reads carries a full **LAN matchmaking** block:
+  `OnlineEnginePort=9000`, `OnlineServicePort=9001`, `FileTransferHostPort=9002/ClientPort=9003`,
+  `LanHostBroadcastPort=9004`, `LanClientBroadcastPort=9005`, `ScanPortStart=9000 ScanPortRange=1000`,
+  `EnableNatTraversal=1`, `SecureSocketEnabled=1`, `MainSocketEncrypted=1`, `MaximumPeerCount=25`.
+  Plus string-only knobs `LanMatchmakingReuseAddress`, `LanMatchmakingDiscoveryOnLoopbackEnable` (present in
+  FC3.dll but absent from the default XML → read as missing→default).
+- `FUN_11733e50` = the **network-engine settings registrar**: registers every defaultnetworkconfig.xml
+  attribute (`TimeOutEnabled`, `SecureSocketEnabled`="Enable network socket security (applied when network
+  engine is restarted)", `LanHostBroadcastPort`, `MainSocketEncrypted`, …) via
+  `FUN_11ab6ed0(name, offset, descriptor, 0x13)`. `FUN_111f6650` = the storm::echo **connection / LAN-matchmaking
+  settings registrar** (`Connection*TimeoutInMs` + the `LanMatchmakingReuseAddress` /
+  `LanMatchmakingDiscoveryOnLoopbackEnable` keys). ⇒ these LAN knobs are real, parsed and applied at engine start.
+- storm::echo carries a LAN subsystem: strings `lanmanager`, `BroadcastLanDiscovery`,
+  `storm::echo::lan::inEvent::DiscoverSession`, `...lan::inEvent::internal::BroadcastLanDiscovery2`.
+
+**Decision — does the engine-transport path live?** YES in principle, and the work is NOT a transport rewrite:
+- The game already ships a first-class, loopback-capable LAN matchmaking module (ports 9004/9005, reuse +
+  loopback-discovery toggles, LAN discovery events). Offline it is reachable *at the netcode level*.
+- The blocker is the **session/lobby layer**, not the transport: the offline solo262 `uplay_r14` fake drops
+  the game into a self-only solo co-op session with **no session browser** (owner's own blocker note
+  m03754/m03905). So `lanmanager` is present but **never driven** — the game never calls host-LAN /
+  discover because the offline flow never reaches a hostable/joinable co-op session state.
+- Therefore "2 live people offline" = a **session-bootstrap / UI** problem (make the offline build open a
+  hostable co-op session + a discover/join path instead of the hardcoded self-only session), NOT a
+  reimplement-PRUDP problem. `SecureSocketEnabled=1` means any join runs through the socket-security layer
+  (blocker #2 nuance) — needs its handshake, but no bulk AES.
+- The literal live test (launch, open LAN browser, host, second instance joins over loopback) is **currently
+  blocked**: there is no LAN browser in the offline flow to host/join through until a hostable offline co-op
+  session is produced. Enabling loopback/reuse knobs alone cannot surface it.
+
+
+## Session 26 (2026-11-10): OpenWorldCoop 1.5 full patch inventory (coop-revive audit, steps 1-2)
+
+Goal now (owner, m04981): make FC3 co-op in the **main world** workable **online** — OpenWorldCoop is the
+only build that ever did it, so per the hub skill `coop-revive` we audit it by subsystem. All artifacts:
+`H:\FarCryCoop\scratch\ow_diff\owdiff_{d3d9,d3d11}.json`, `patchdiff.json`; scripts
+`local/scratch/ow_diff.py`; extracted trees `H:\FarCryCoop\scratch\ow_extract` (3316 files) vs
+`H:\FarCryCoop\scratch\van_extract` (427, pristine 1.06 patch.dat md5 5a788dd5f7befada6e6919ec1799c172).
+
+**Native side is TINY (184 bytes total in FC3.dll; 134 in FC3_d3d11.dll; zero new code):**
+- 2 streaming hooks: stock 5x NOP sites 0x8C306B and 0x8C4036 (file 0x8C406B/0x8C5036) replaced by
+  `E8 rel32` CALLs to the SAME existing stock function **RVA 0x8C2F09** (d3d11: sites 0xA1D1E2/0xA1E1AD
+  -> 0xA1D080). Ghidra FC3_105_OW analysis running (bg, `H:\FarCryCoop\scratch\ghidra\owan.log`)
+  to name that function + call-site contexts.
+- map string: 0x15341D0 `mpdlc1_aegir` -> `fc3_main` (the H7a string, ships in OW).
+- streaming/range tunings x4-ish: 256->512, 1536->5120, 2048->5120, 1280->5120, 128->512, 1.29e5->5.13e5,
+  0.7708->0.6625, 4.75->5.625; u24 0x49BB80->0x4A9C40 @0x1535959.
+- 14 single-byte config-key renames 'F'/'C'->'X' (0x2799DA.., 0x151BBFF.., 0x15D6220.., e.g. FOVTime key
+  family) = disable vanilla behaviours via missing config keys.
+- 6 single-byte value bumps (8->9, 6->7, 7->8) @0x2799DA/9FB/27AA27/48 + 0x59237A/9B.
+
+**Data side (patch.dat):** 427 -> 3316 entries; +2859 repacked island `.fcb` chunks (the island rebuilt
+for co-op streaming; depload.dat 1.35MB->2.92MB), +53 config/script, 7 CHANGED `lib_defend` outpost loras
+(wave logic), 13 `__unknown/scripts/*.lua` = MORE lib_defend outpost variants (nowave/hard/med/easy+dog).
+Key added files: `engine/gamemodes/gamemodesconfig.xml` (FCXCoop desc @line325, Mask=128; service list;
+NO fc3_main string -> map choice is NOT here), `engine/settings/defaultnetworkconfig.xml`
+(**MaximumPeerCount=25**, ports 9000-9005, MainSocketEncrypted=1, SecureSocketEnabled=1, EmulatorEnabled=1,
+20 Mbit upload), `engine/settings/pc/defaultengineconfig.xml`, `defaultrenderconfig.xml`,
+`domino/system/worldloadpause.lua` (SP->coop sync shim: storms/wind/navmesh-regen/zodiac gunner),
+`domino/system/coop/allplayers/enableinitialspawn.lua`, `coop/misc/strayplayerzone_v2.lua`,
+`system/ai/spawnreinforcement_v4.lua`, `library/coop/zz_devhelpers._playerloop.lua`,
+`engine/scripts/game/newbrains/*.ai.rml` (animal brains), 2 gosm pawn statemachines,
+`spbarkmanager.xml`, `inputactionmapcommon.xml`, oasisstrings bin. Removed: some boat props graphics,
+2 cutscene cseqs, fc3coopintro.bik (trim, not function). + fc3_main_vistas.dat 3.06GB (129 894 entries).
+
+**Reading:** the mod is (a) retarget 2 NOP sites to an existing stock streaming fn, (b) point the co-op
+map string at fc3_main, (c) x4 streaming constants, (d) ship a rebuilt island world (.fcb+vistas) +
+coop-completed SP configs/scripts, (e) peer cap 25. Nothing else. Revive = reproduce/verify (a)-(d), then
+make ONLINE join work (server state 2026: see prior web research; reddit 2026-09 "Co-Op not available" =
+open question).
+
+
+### Session 26b (2026-11-10, agent) — KEYSTONE VERIFIED: the 1.05 engine runs on 1.06 data
+
+Test in `H:\FarCryCoop\TestFC3_105` (owner rule: all tests run from this folder — upc launches
+whatever folder is configured for the game there). Swapped in genuine vanilla 1.05 bin
+(`FC3.dll` 5ff04533, `farcry3.exe` 203816->202088) + pristine 1.06 `patch.dat` (5a788dd5), set the OW
+vistas pair aside, then launched `bin\farcry3.exe` directly (offline, uplay_r14 + solo262 loaders kept):
+- Game boots to main menu; a dismissable dialog "Служба Far Cry 3 недоступна" appears (service
+  warning, not fatal - menu works behind it).
+- With `FC3.dll` = hybrid (md5 341888251150, scratch\FC3_hybrid.dll) the menu fully loads
+  (ИГРА / СОВМЕСТНАЯ ИГРА / КОЛЛЕКТИВНАЯ ИГРА visible; coop browser reachable).
+- Keyboard nav (arrows+Enter) -> slot "new game" -> "ВНИМАНИЕ: slot has save, load?" -> НЕТ ->
+  **the island world LOADED and rendered** (opening scene, night jungle, flare). fc3_main.dat 1.06
+  (fea2e5a1) + 1.05 engine = fully playable boot. 
+- Swap state saved aside: `H:\FarCryCoop\scratch\swap_105_datatest\` (patch_solo262.dat/fat,
+  fc3_main_vistas pair). Revert = move those back.
+
+Consequences:
+- The OpenWorldCoop full stack (OW FC3.dll = 1.05 + 184-byte patch, OW patch.dat, OW vistas) can run
+  in this folder with the same data minus no version barrier: engine-data compatibility proven.
+- Next: offline regression (hybrid + solo262 patch.dat + vistas -> local co-op island), then
+  install the OW stack for the ONLINE main-world co-op attempt via real upc.
+
+> **Correction (same session, later).** The 26b test actually ran on the **1.05** `patch.dat`
+> (192,307,217 B; hash 5a788dd5 = vanilla 1.05 at `Downloads\OW15\game\data_win32\patch.dat`),
+> NOT a 1.06 patch as first claimed. The world archive `worlds\fc3_main\fc3_main.dat` **is** the
+> 1.06 one (fea2e5a1, 3,496,061,837 B, verified vs the Uplay install) and the vista pair was the
+> OpenWorld 2020 pair (cb5da2c2, 3.0 GB). So the keystone still holds in its essential form:
+> **1.05 engine + the 1.06 fc3_main world archive + OW vistas = the island loads and renders.**
+> (Which FC3.dll was in `bin` at that launch, vanilla 5ff04533 or hybrid 341888251150, was not
+> logged; the d3d11 DLL loaded by `farcry3_d3d11.exe` was solo262's patched 46bcc097.)
+
+### Session 26c (2026-11-10, agent) — OpenWorld stack is online-only; live boot matrix
+
+File identity facts (all verified by md5 this session):
+- `data_win32\patch.dat` sizes/roles: vanilla **1.05 = 192,307,217 B** (5a788dd5), solo262 mod262
+  patch = 212,002,032 B (157f2d76), **OpenWorld Patch 1.5 patch = 90482fbe** (192,307,217 B, same
+  size as vanilla 1.05, different content), vanilla **1.06 = 202,132,751 B** (`_backup_106_before_solo262`).
+- OpenWorld `FC3.dll` (927a1a30, 29,994,856 B) differs from vanilla 1.05 (5ff04533) by only
+  **~100 bytes**: cosmetic string renames (`FOV`->`XOV`, `CoopNameplates`->`XoopNameplates` -
+  likely to dodge some name filters), float blobs, and ONE functional string swap:
+  `mpdlc1_aegir` -> `fc3_main` at file offset `0x15345d0`. **The OW binary patch contains no
+  service/offline bypass at all** - online Ubisoft party services are a hard dependency.
+- OpenWorld `FC3_d3d11.dll` = 07abaf66. Full OW stack lives at `H:\FarCryCoop\Downloads\OW15\game`
+  (patch.dat 90482fbe + vistas cb5da2c2 3.0 GB).
+
+Live boot matrix (folder `TestFC3_105`, launched directly via `bin\farcry3.exe`, no launcher):
+- solo262 data (157f2d76) + hybrid FC3.dll 341888251150 + 1.06 fc3_main + 1.06 vistas 87151f18:
+  boots to main menu (service dialog dismissable), the coop submenu shows three entries
+  (ИГРА ОНЛАЙН / ВМЕСТЕ ВЕ СЕТИ [green highlight = the offline coop entry] / ВСТУПИТЕЛЬНЫЙ РОЛИК)
+  but **none responds to Enter or mouse click** in this data state (the FC3.log for the session
+  could not be found on C:, profile likely on another drive/moved).
+- solo262 data + vanilla 1.05 FC3.dll 5ff04533 + solo262 FC3_d3d11.dll 46bcc097: boots to menu fine.
+- OW stack (927a1a30/07abaf66 + 90482fbe): **fatal dialog "Служба Far Cry 3 недоступна. Перезапустите
+  игру."** (needs service connection at boot). Also fatal via `uplay://launch/46/0` while Ubisoft
+  Connect was freshly restarted and **online** - i.e. the FC3 game service (Rv/party) really is
+  shut down server-side; upc-online is not enough. (The 2025-09 steam "still works" thread is about
+  other people's machines/versions, not this service.)
+- 1.05 host command line `-host fc3_main -login tester -coop` (direct launch, solo262 data):
+  **fatal service dialog** - the `-host` branch needs the service provider even though session
+  type 3 (local) is what it creates; the same game without the flags boots to the menu normally.
+  So the CLI host path is service-gated too, offline coop remains menu-entry-only.
+
+Converged conclusion (third independent confirmation): **the single blocker for both the offline
+coop entry and any online flow is the Ubisoft party/session service glue in the `uplay_r14` orbit
+API.** The next engineering step is the in-process orbit-API responder (uplay_r14 is loaded
+in-process; FC3 binds it via `GetProcAddress("OrbitApi_InterfaceRequest")` - we control that
+loader), faking: party member list (2-4 slots), `IsPartyLeader=true`, and a GameSession create/join
+success over the local session type 3 path. Assets: session-24 `CoopOfflineV2.java` artifacts +
+`local/scratch/multislot_design.md` (offline multi-slot) + the 100-byte diff proof above.
+
+Folder `TestFC3_105` after this session: solo262 data (patch 157f2d76) + vistas OW cb5da2c2 +
+FC3.dll = vanilla 1.05 5ff04533 + FC3_d3d11 = solo262 46bcc097. The hybrid FC3.dll is saved at
+`H:\FarCryCoop\scratch\swap_105_datatest\solo262_state\FC3_hybrid.dll`; OW state =
+`Downloads\OW15\game` (see `swap_105_datatest\ow_state\README.txt`).
+
+
+## Session 27 (2026-11-10): uplay_r1_loader orbit-API proxy built + forwarding verified; build made reproducible
+
+Follows the Session 26c conclusion that the single blocker is the Ubisoft party/session service glue in the
+`uplay_r14`/`uplay_r1_loader` orbit API. First engineering step: a pass-through logging proxy that wraps the
+real loader and records every orbit call FC3 makes, so the host/join surface can be observed before faking it.
+Source `src/uplay_proxy/{uplay_proxy.cpp,uplay_proxy.def,proxytest.c,build.bat,build_x86.bat}`; generator
+`scripts/gen_uplay_proxy.py` (emits the 58-export thunk table + the `.def`). Artifacts under `local/scratch/`.
+
+- **Design.** `uplay_r1_loader.dll` (x86) exports the 58 `UPLAY_*` cdecl functions as naked stack-forwarding
+  thunks (`th_0..th_57`). At `DllMain` it loads the genuine loader from `<bindir>\real\uplay_r1_loader.dll`
+  (`LOAD_WITH_ALTERED_SEARCH_PATH`), resolves its exports by name, and wires each thunk to forward + log
+  (seq, timestamp, 8 stack args, caller `module!+RVA`, return). FC3 is bound to the loader, so this DLL is a
+  transparent, observable shim. Installed at `H:\FarCryCoop\TestFC3_105\bin\uplay_r1_loader.dll`; the real one
+  sits at `...\bin\real\uplay_r1_loader.dll` (294400 B).
+- **Forwarding verified in situ.** Offline solo262 boot: `uplay_api.log` shows `real=<base> exports=58
+  missing=0`, and the game calls exactly two orbit functions before the menu — `UPLAY_Init`
+  (`FC3_d3d11.dll+0x420a2d`, ret=1) and `UPLAY_PARTY_Init` (`FC3_d3d11.dll+0x77d52f`, ret=1). Both returned
+  through the proxy with real's own value ⇒ the forward path is transparent in the live game.
+- **Forwarding verified in isolation.** `proxytest.c` (x86 console) loads the proxy directly and calls
+  `UPLAY_USER_IsConnected / UPLAY_Init / UPLAY_Poll / UPLAY_PARTY_*`; the proxy logs `real=<base> exports=58
+  missing=0` and forwards each call to the real loader. (The real loader, loaded *without* the proxy, spawns
+  orbit/service worker threads that outlive `main`, so a bare real-loader probe hangs and must be run detached.)
+- **Build made reproducible.** `build.bat` / `build_x86.bat` called `vcvars64.bat` (and `build_x86.bat` even
+  passed `-arch_host=x64 -arch=x86`, which VS18's `vcvars64` ignores → env not set). Both now use `vcvars32.bat`
+  (correct 32-bit toolchain for the `/MACHINE:X86 /DWIN32` target). A fresh `build.bat` run reproduces the
+  deployed proxy **byte-for-byte** (SHA-1 `153e016e…`, `machine 0x14c`, 58 exports), confirming the tree is the
+  real source of the running shim.
+- **Callers tagged.** The logger annotates known reverse-engineered sites: RVCreateGameSession
+  (`FC3.dll+0x00cf6790`), RVJoinGameSession (`FC3.dll+0x00cf6690`), a party-glue region
+  (`FC3.dll` RVA range `0x10620400..0x10623500`), and loader `FUN_113409d0`. These fire only once the game
+  actually attempts a host/join.
+- **Reading + next step.** The two-orbit-call boot trace confirms the 26c blocker in a third way: the offline
+  flow never reaches a hostable/joinable co-op session, so no `UPLAY_PARTY_GetFullMemberList`,
+  `UPLAY_PARTY_IsPartyLeader`, `UPLAY_SetGameSession` or RVCreate/RVJoinGameSession ever appear. The proxy is
+  now a solid observation harness; the next move is to make the game reach the host/join path (drive the co-op
+  UI, or detour the FC3 session callers) and then start faking, in this same proxy, a 2-4 slot party member
+  list, `UPLAY_PARTY_IsPartyLeader=true` and a GameSession create/join success over the local session type-3
+  path.
+
+
+## Session 28 (2026-11-11): orbit-API proxy gains env-gated party-gate fakes; generator regressions fixed
+
+Continues Session 27. Goal: take the orbit-API proxy from pure observation to the first safe *fake*, to test
+the 26c hypothesis (the co-op menu is dead because the party/online gates read the dead Ubisoft service).
+Artifacts: `src/uplay_proxy/{uplay_proxy.cpp,uplay_proxy.def}` (regenerated), `scripts/probe_orbit_gates.py`,
+`scripts/gen_uplay_proxy.py`.
+
+- **ABI check first (`probe_orbit_gates.py`).** In the real `bin\real\uplay_r1_loader.dll` the gate exports
+  (`UPLAY_USER_IsConnected`, `UPLAY_PARTY_IsInParty`, `UPLAY_PARTY_IsPartyLeader`, the member-list getters,
+  `UPLAY_PARTY_Init`) are all 5-byte `jmp` thunks in a two-level stub table (the loader itself forwards to the
+  orbit/service impl over a named pipe). So the bool gates are `int(void)` cdecl returning the service value;
+  with the service dead they return FALSE, which is exactly what gates the co-op menu off.
+- **Fake added, ABI-safe and gated.** `gen_uplay_proxy.py` now emits a per-export `g_fakeval[NEXP]` table and a
+  runtime `g_fake` flag from `getenv("FC3COOP_FAKE_PARTY")`. In `apiThunk`, a fake slot short-circuits
+  (`if (fk) r = fk; else if (real) {forward}`) and logs the line with a ` [FAKE]` suffix. Only the three
+  zero-arg bool gates are forced to 1 (`IsConnected`, `IsPartyLeader`, `IsInParty`); the member-list /
+  `SetGameSession` calls stay **forwarded** (faking them needs the member-list struct layout - crash risk,
+  deferred). Default (no env) = byte-for-byte the pure-forwarding behavior of Session 27.
+- **Three latent generator regressions fixed (important).** The committed `gen_uplay_proxy.py` no longer
+  reproduced the committed `uplay_proxy.cpp`: it built the three `fprintf` format strings and the four caller
+  tag strings with `qh(chr(34)+FMT)[:-1]`, which drops the last format char and emits a broken `\"...%` (no
+  closing quote), and it emitted `strcpy(s+1, "real" BSB "uplay_r1_loader.dll")` where `BSB` is a `char[]`
+  variable, not a literal (does not compile). Regenerating now corrupted those lines. Fixed to
+  `chr(34)+FMT+chr(34)` and back to `sprintf(s+1,"real%suplay_r1_loader.dll",BSB)`. With the fakes removed the
+  regenerated cpp is again identical to HEAD, so the fake build is trustworthy; `build.bat`/`build_x86.bat`
+  use `vcvars32` (fixed in Session 27) and `cl` exits 0 (only C4996 deprecation warnings).
+- **Built + deployed.** Fresh x86 proxy `machine 0x14c`, 58 exports, `sha1 2de99a7e…`, installed at
+  `H:\FarCryCoop\TestFC3_105\bin\uplay_r1_loader.dll` (fake OFF by default; the real loader stays at
+  `bin\real\`). The `proxy up:` log line now reports `fake=%d`.
+- **Open (runtime verify).** Whether the offline game actually calls the gate functions (and whether forcing
+  them to 1 revives the co-op host/join menu) needs a live run with `FC3COOP_FAKE_PARTY=1`. The `proxytest.c`
+  harness cannot prove it standalone: loading the real loader spawns orbit/service worker threads that
+  outlive `main`, so the harness hangs and must be run detached with a kill-timeout. Live boot only calls
+  `UPLAY_Init`+`UPLAY_PARTY_Init`; the gates fire on co-op-menu navigation. Deferred to the next step.
+- **Transport decision recorded.** For FC3 the transport is the engine's own `storm::echo` LAN/loopback
+  (the coop-networking skill's "the engine's own netcode" option), NOT the Steam Spacewar (AppID 480) relay:
+  FC3 is not a Steam app at runtime (`no steam_api.dll`, runs via the Ubisoft Connect loader), and the relay
+  only bridges a session the game must first open - which is this session-glue problem, one layer below. The
+  HXCoop relay stays a documented phase-2 (over-the-internet) option.
+
+
+### Session 28b (same day) — runtime addendum: fake mechanism PROVEN; live menu-nav needs the owner's run
+
+- **Fake path verified at runtime** (proxytest, `FC3COOP_FAKE_PARTY=1`): `UPLAY_USER_IsConnected` logs
+  `[FAKE] ret=1 (0x1)` (the gate short-circuits) while `UPLAY_Init` forwards normally (`ret=0`, no `[FAKE]`).
+  So `g_fakeval` + `g_fake` + the `[FAKE]` log marker all work; the earlier proxytest "hang" was only the real
+  loader's orbit/service worker threads outliving `main` after the fake returned, not a fake-path failure.
+- **A direct game launch with `fake=1` reaches the loader but not a menu.** Launching `bin\farcry3.exe` with
+  the env set: the stub re-execs to `farcry3_d3d11.exe`, the proxy attaches `fake=1`, and the boot trace is the
+  usual `UPLAY_Init` + `UPLAY_PARTY_Init` only - but no window is created (the direct-launch path does not
+  complete the DRM/Uplay handshake without the `upc Play` + junction flow of Session 13b), so there is no menu
+  to drive and the gate functions (which fire on co-op-menu navigation) are never reached. The process was then
+  reaped; no orphan left.
+- **What this leaves for the owner (the actual hypothesis test).** Run the working interactive boot
+  (`upc Play` via the junction on `TestFC3_105`) with `FC3COOP_FAKE_PARTY=1` set for the game process, then
+  open the co-op submenu and try host/join. Watch `bin\uplay_api.log`: the gates should now log `[FAKE] ret=1`,
+  and the open question is whether the previously-dead co-op entries (`ВМЕСТЕ ВЕ СЕТИ`) become responsive. If
+  they do, the next fake to add is the member list + a `SetGameSession` success (needs the struct layout).
+
+
+### Session 28c (same day) - orbit-API consumers disassembled: gate-fakes validated, roster fake belongs at the Rv layer
+
+Static RE of the `uplay_r1_loader.dll` consumers in `FC3_d3d11.dll` (machine 0x14c, base `0x10000000`; probes
+`scripts/probe_memberlist_imports.py` + a raw-byte `call/jmp [IAT]` scan). FC3 imports the orbit API from
+`uplay_r1_loader.dll` (IAT block `0x114aca64..0x114acac8`) and calls it through a run of `jmp [IAT]` import
+trampolines at `0x10e5b044..0x10e5b0b6`: `Init` `0x10e5b044`, `IsConnected` `0x10e5b07a`, `SetGameSession`
+`0x10e5b08c`, `PARTY_Init` `0x10e5b092`, `GetFullMemberList` `0x10e5b0a4`, `IsPartyLeader` `0x10e5b0b6`.
+
+- **`IsPartyLeader` is consumed as a plain bool** - the gate-fakes already shipped are the right shape.
+  Callers: `0x1077ddea` -> `mov byte ptr [esi], al` (stores the leader flag straight into a byte), and
+  `0x1077e9e7` -> `test al,al; je ...; mov byte ptr [ebp-1],1` feeding UI/permission state (then tests
+  `[edi+0x14] & 2` and reads `[ebx+0x248]`). So forcing the loader to return 1 makes FC3 store `leader=true`
+  with no struct involved - the ABI is validated at the consumer, not just assumed.
+- **`GetFullMemberList` is only null-checked, never field-read, in FC3.** Its sole trampoline caller
+  `0x1077d6b1` is `test eax,eax; jne <ok>; push 0x11e67ed8 (assert str); call 0x10e5b080` - it treats the getter
+  as "is there a member-list pointer" and never iterates member entries. Therefore the trusted 2-4 roster the
+  co-op logic uses is the internal Rv party controller (Session 22: `provider+0x38/+0x3c`, `FUN_11273650`),
+  not the Uplay getter. **Consequence for the plan: the "member list + SetGameSession" fake must target the Rv
+  party controller (the PLAN's S2 join-param detour / trusted-member-list hook), not the orbit loader.** Faking
+  `GetFullMemberList` in the proxy would not feed a roster into gameplay.
+- Net: the three loader gate-fakes (Sessions 27-28) are correctly shaped and are the right first probe; the next
+  real work item (a 2-4 roster) is a detour of the Rv party controller, matching the session-22/24 hook points.
+
+
+### Session 28d (same day) - Rv party-controller probe: roster is a service object graph; join-gate is the detour point
+
+Offline disasm of the Rv party/session controller hooks named in Sessions 22/24 over the 1.06 `FC3.dll`
+(`H:\Uplay\Far Cry 3\bin\FC3.dll`, md5 `5742de2a`, machine 0x14c, base `0x10000000`, `.text` to `0x11bcac61`;
+probe `scripts/probe_rv_party.py`). These are 1.06 addresses (the 1.05 `FC3.dll` md5 `5ff04533` `.text` ends at
+`0x1149d215`, so `FUN_11273650` is 1.06-only).
+
+- **`FUN_11273650` (trusted member list) walks a service object graph, not a flat array.** Body:
+  `mov edi,[edx+4]; add edi,0x120; call 0x10070590; cmp eax,edi` (the `+0x120` matches the Session 22
+  "host == session+0x120" note), then a getter chain `[[eax+0x18]+0x20] -> [ecx] -> vtable[+0x2c] -> call eax`
+  yielding a member object; it then tests `[ecx+0x64]`, `test byte[edx+0xec],8`, and does a refcount
+  `dec dword[ecx+4]`. Conclusion: the trusted roster is a live object graph reached through getter `0x10070590`
+  and vtable slots, so a roster fake must populate/detour that controller, consistent with Session 28c
+  (not the loader). 
+- **`FUN_11218480` (join gate) decodes cleanly and is the best detour candidate.** It reads `[esi+0x30]`,
+  writes `mov dword[edx],1` (an out-param true), builds a tagged string object (vftable `0x11fabf24`) and
+  returns `al=1` via `ret 0x14`. It is a validator/acceptor with a single boolean outcome -> hooking it to
+  return pass + a synthetic member is the concrete join-shim hook point (PLAN S2).
+- **`FUN_1006f990` (host test) and `FUN_103660e0` did not decode at these addresses** on this build
+  (`0x1006f990` starts with a lone `ret`; `0x103660e0` misaligns) -> do NOT trust these two addresses as-is;
+  re-derive them from the `FC3_106` Ghidra project (their Session 22 semantics may sit at shifted addresses
+  between the Ghidra snapshot and md5 `5742de2a`).
+
+Next (design): build the roster detour at `FUN_11218480` + the `0x10070590` member-object getter, and verify the
+member-object field layout by reading what `FUN_11273650`'s downstream consumes, before writing any fake.
+
+
+### Session 28e (same day) - roster data structure cracked: a std::map keyed by 64-bit member id; join-gate is virtual
+
+Follow-up to 28d (`scripts/probe_rv_detour.py`, xref + aligned disasm over the 1.06 `FC3.dll` md5 `5742de2a`).
+
+- **The trusted roster is a `std::map` keyed by a 64-bit member id.** The getter `0x10070590` walks a
+  red-black tree: node child links at `[node+0x00]`/`[node+0x04]`, the key's low dword at `[node+0x10]` and high
+  at `[node+0x14]`; on miss it returns `edi` (the map end/`this`). So populating the roster for a fake 2-4 party
+  means inserting map nodes keyed by member id, not writing a flat array. `FUN_11273650` then reads each member
+  object's fields via vtable slot `[+0x2c]`, tests flag `byte[+0xec]&8` and `[+0x64]`.
+- **The join gate `FUN_11218480` is a virtual method** (0 direct `call` xrefs; it ends `ret 0x14`). Hook it via
+  its vtable slot, or hook its consumers instead.
+- **The co-op roster/join controller block is `~0x11218480..0x112185xx`.** `FUN_11273650` (trusted list) has
+  exactly 2 callers - `0x11218506` (this block) and `0x1127422a` (deeper in the controller); `FUN_103660e0`
+  (member query) has 1 caller - `0x112184dc` (same block). That block is where host/join resolves the party.
+- **The member query `FUN_103660e0` is anchored on a service singleton** at globals `0x12854784` (object) and
+  `0x1285478c` (compare value); it calls the object's vtable `[+0x4]`, checks `[+0x4]==1` and `[+0x8]==0x1285478c`.
+  That singleton is a strong detour anchor: forcing/observing it may be simpler than patching the map directly.
+- **`FUN_1006f990` is NOT the host test in this build** - it is a 1-byte `ret` stub with 495 callers (a trivial
+  default method). The Session 22 "host test == session+0x120" address is mis-mapped against md5 `5742de2a`; the
+  real leader/host test is elsewhere (the `add edi,0x120; call 0x10070590; cmp eax,edi` inside `FUN_11273650` is
+  the actual host comparison). Re-derive `FUN_1006f990` before any use.
+
+Detour design (next): either (a) populate the roster `std::map` (getter `0x10070590`, key = member id) + make the
+`0x12854784` singleton report membership, or (b) detour the controller block `0x11218480..0x112185xx` to inject a
+synthetic 2-4 roster and force the join-gate pass. (b) is the smaller surface; both need the member-object field
+layout (vtable `+0x2c` / `[+0x64]` / `[+0xec]`) read from what `FUN_11273650` consumes downstream.
+
+
+### Session 28f (same day) - party-controller field map: two member-slot groups + presence mask; roster detour spec
+
+Extends 28e (disasm of the FUN_11273650 tail and the deeper caller FUN_1127422a on the 1.06 `FC3.dll`).
+
+- **Party controller (`this` = `ebx`) field map** (from FUN_11273650's teardown path):
+  - two parallel member-slot groups: group A at `+0x30`(ptr) / `+0x34`(byte flag, set to 1) / `+0x38`(container),
+    group B at `+0x54`(ptr) / `+0x58`(byte flag) / `+0x5c`(container); each container is released via `0x10116890`;
+    guards `+0x44`, `+0x68` (non-zero -> release path).
+  - presence bitmask: `[+0x24] & [+0x28]`, compared to `-1` (0xFFFFFFFF = "no member").
+  - the roster container the emptiness predicate uses is at **`+0x5c`** (caller FUN_1127422a does
+    `cmp ecx,[esi+0x5c]; jb ...`), so the trusted party is `+0x5c`, mirrored by `+0x38`.
+- **Member object state**: inner object via `[member+0x64]`, state flag `byte[inner+0xec] & 8` (a boolean gate
+  the join path tests before accepting the member).
+- **Implementation-ready roster detour (spec for the next step):** populate the `+0x5c` roster container
+  (`std::map` by 64-bit member id, node key lo/hi `+0x10/+0x14`) with 2-4 member entries, set `+0x58`/`+0x54`
+  (group B) and the presence mask `[+0x24]&[+0x28]` to a non-(-1) value, and make each member's inner
+  `byte[+0xec]&8` pass. The smaller-surface alternative remains a detour of the controller block
+  `0x11218480..0x112185xx` (join gate is virtual there). The service singleton `0x12854784`
+  (from 28e) is the least-invasive observation point.
+- Caution: all offsets are for the 1.06 build md5 `5742de2a`; and none of this is verifiable without the live
+  game reaching a host/join (owner `upc Play` run with `FC3COOP_FAKE_PARTY=1`), so the next actionable move is
+  that live run, not more static RE.
+
+
+### Session 28g (same day) - authoritative decompile of the party gate; corrects 28e/28f (`scripts/ghidra/DecompileParty.java`)
+
+Ran Ghidra's real decompiler over the analyzed `FC3_106` project (must run in an isolated `-scriptPath`:
+the scratch scripts dir has stale non-compiling scripts that poison the Java bundle compile). Output
+`decomp_party.txt`. This replaces several 28e/28f capstone guesses with ground truth.
+
+- **Join gate `FUN_11218480` (thiscall, this = param_1; body 0x11218480-0x11218775).** It resolves the party
+  manager from a **global singleton `DAT_12805180` -> `+4`** (`iVar3`). The gate passes only when ALL hold:
+  1. `FUN_102000d0(mgr, mgr+0x118, mgr+0x11c) != 0` (online/connected check on the manager),
+  2. `FUN_11216750() == 0` AND `FUN_112166f0() == 0` AND `FUN_11216690() == 0` (three negative blockers),
+  3. `FUN_103660e0() != 0` - and this returns the party-service object (so it is a **getter**, not a query).
+- **`FUN_103660e0` = party service getter** (uses singleton `0x12854784`; the gate then reads the returned
+  manager's `+0x74` and passes it to the roster builder).
+- **The roster the gate consumes is a vector of 0x20-byte member entries**, built by
+  `FUN_11273650(mgr, &out)` (out = {data, end, capacity}); the gate iterates `for p in out step 0x20`.
+  Member id/name strings come from `[mgr + 0x3c + i + 0x14]`; a member's vtables are `PTR_FUN_11f57660`
+  and `PTR_FUN_1201fa24`; per-entry `local_28 = (*[DAT_12805180+4] + 0x274) != 0` is the **is-local-player** flag.
+  Empty roster (`count == 0`) diverts to the solo path (`FUN_112734a0` + `FUN_112163b0` + `FUN_10366240`).
+- **Corrections to 28e/28f:** `0x10070590` is NOT a standalone map getter - it lies inside `FUN_10070470`
+  (a container grow/realloc). `FUN_1006f990` is NOT a stub - it is the RB-tree `lower_bound` on `[this+8]`
+  (the manager's internal id->member index). The "std::map to populate" framing was wrong at the gate level:
+  the gate reads the **0x20-byte vector from `FUN_11273650`**, which is derived from `[mgr+0x38]/+0x3c` (the
+  netcode-fed member table), not from the map directly.
+
+**Detour target restated (authoritative):** to make host/join present a 2-4 party offline, satisfy the four
+`FUN_11218480` gate conditions and make the manager's member table (`mgr+0x38` count, `mgr+0x3c + i + 0x14`
+ids) yield 2-4 entries so `FUN_11273650` emits a non-empty vector. The least-invasive observation point is the
+`DAT_12805180+4` singleton (the manager). All addresses 1.06 md5 `5742de2a`. Still needs the live game to verify.
+
+
+### Session 28h (same day) - gate sub-conditions decompiled: two singletons + a session state machine (`scripts/ghidra/DecompileGate.java`)
+
+Decompiled the four `FUN_11218480` gate sub-conditions + solo helper. Closes the static-analysis line: every
+downstream condition depends on runtime netcode state, so the loader-fake↔gate link can only be settled live.
+
+- **`FUN_102000d0(mgr, mgr+0x118, mgr+0x11c)` (the positive "connected" condition):** requires
+  `((mgr+0x118) & (mgr+0x11c)) != 0xffffffff` (a valid party id present), then calls the RB-tree lower_bound
+  `FUN_1006f990()` to find the **local player node in the manager's member tree at `[mgr + 0x120]`**; on a hit it
+  walks a vtable `+0x2c` and resolves the member against a **lobby array at `[mgr+0x1ec] / [mgr+0x1f0]`** and the
+  member's `+0x98`. => This condition is only satisfiable when the manager's member tree AND a lobby exist - i.e.
+  it is netcode-fed, the real offline blocker.
+- **The three negative blockers all read the session/mode singleton `DAT_12804acc`** (`+0x6c` = has-session byte,
+  `+0x68` = session object):
+  - `FUN_112166f0()` returns `[session + 0x9b8] == -7`;
+  - `FUN_11216690()` returns `[session + 0x9b8] == -6`;
+  - `FUN_11216750()` is a session state handler (dispatches on the same `DAT_12804acc` session state).
+  The gate needs all three false => the session status code must be neither -6 nor -7 and the session object must
+  be in a normal (non-error) state.
+- **Two governing singletons:** `DAT_12805180 + 4` (network/party manager: member tree `[+0x120]`, member table
+  `[+0x38]/[+0x3c]`, lobby `[+0x1ec]/[+0x1f0]`, id fields `[+0x118]/[+0x11c]`) and `DAT_12804acc` (mode/session
+  controller: has-session `[+0x6c]`, session `[+0x68]`, status `[session+0x9b8]`).
+- **Conclusion (static terminus):** the party gate is a runtime session state machine. Faking the Orbit SDK calls
+  at the loader (the `uplay_proxy` gate-fakes) only helps if Ubisoft Connect's loader actually drives these two
+  singletons into a valid-party state. That cannot be observed statically; the decisive next action is the live
+  `upc Play` run on TestFC3_105 with `FC3COOP_FAKE_PARTY=1`, inspecting whether the co-op submenu path in
+  `FUN_11218480` is taken (add breakpoints / log at `DAT_12805180+4` and `DAT_12804acc+0x6c` when building the
+  test mod). All addresses 1.06 md5 `5742de2a`.
+
+
+### Session 28i (same day) - fixed the proxy's unsafe re-call (ABI bug) -> tail-call; deployed `sha1 e045f054`
+
+A live `upc Play` attempt crashed `farcry3_d3d11.exe` with **0xc0000005 (access violation), faulting module
+"unknown 0.0.0.0", BEX/StackHash_2beb**, immediately after `UPLAY_PARTY_Init`; the orbit party-gate fakes were
+NEVER reached (no `IsConnected`/`IsPartyLeader` calls from the game). Re-reading `gen_uplay_proxy.py`, the old
+`apiThunk` **re-called** the real export with a fixed 8-arg `__cdecl` prototype and without preserving `ecx` -
+wrong for any non-cdecl / thiscall / pointer-returning export, which corrupts the caller. Rewrote it:
+
+- `apiThunk` -> `log_entry(int slot, void** argp, DWORD retaddr)`: only READS the 8 stack args under SEH and
+  logs; it never calls the real function.
+- Every export (all 58, `cdecl`+`others` unified) is now a naked thunk: `pushfd; pushad; lea eax,[esp+40];
+  mov edx,[esp+36]; push edx; push eax; push slot; call log_entry; add esp,12; popad; popfd;` then either
+  `mov eax,1; ret` (the 3 gate fakes) or `mov eax,[g_rawp_i]; jmp eax` - a **tail-call that preserves the caller's
+  exact stack, return address and registers (incl. ecx)**, so the real export runs with a byte-exact ABI.
+- Rebuilt x86 clean (only C4996 deprecation warnings), `machine 0x14c`, 58 exports, deployed to
+  `TestFC3_105\bin\uplay_r1_loader.dll` = `sha1 e045f054...`.
+- Caveat: `proxytest.exe` (dummy args) still exits 0xc0000005 via the proxy while the direct-real run times out
+  on a network-blocking export - the harness diverges for reasons unrelated to the forwarding (garbage args +
+  fake=1 branch), so it is NOT a clean proxy-vs-real discriminator. The proxy change is justified by the code
+  analysis and the in-game 0xc0000005; the definitive test is the live game, currently blocked (see below).
+- **Current blocker is no longer code:** Ubisoft Connect refuses to launch the game for the signed-in account
+  ("could not verify access to this game"). The game needs the UC DRM handshake to reach a window (direct
+  `farcry3.exe` launch exits with no window), so this entitlement check gates every live test. Owner-side to
+  resolve; see NOTES live-test procedure. No personal identifiers recorded here.
+
+
+### Session 28j (same day) - CORRECTED launch model: upc launches `TestFC3_105` directly; junction method is obsolete here
+
+Owner correction (authoritative, fix this in every future session): **Ubisoft Connect's registered Far Cry 3
+install path on this PC is `H:\FarCryCoop\TestFC3_105` itself** (the owner pointed upc at that folder earlier).
+Therefore upc's Play button runs `H:\FarCryCoop\TestFC3_105\bin\farcry3.exe` DIRECTLY. The Session-13 junction
+trick (register `H:\Uplay\Far Cry 3`, then `mklink` it to the copy) is **obsolete on this PC and must not be
+used** - it renames the real install for no benefit and strands it (see below). This is the root cause of the
+confusion in Sessions 28b/28i: the game was always launching from the copy; the fake=1 runs were real upc launches
+inheriting HKCU env, and helper-based direct launches are a different, no-window path.
+
+- Env consequence: because **upc** (not a helper) spawns the game, the gate-fake switch must live in HKCU -
+  `setx FC3COOP_FAKE_PARTY 1` + a full Ubisoft Connect restart - for it to reach the process. A helper that sets
+  env only for its own child does not represent the upc path.
+- Stray filesystem state from the abandoned junction (verified): `H:\Uplay\Far Cry 3` is MISSING and the real
+  install sits renamed at `H:\Uplay\Far Cry 3.OFFICIAL`. Cleanup (owner, admin): run `undo_junction.bat` - with no
+  junction present it only renames `Far Cry 3.OFFICIAL` back to `Far Cry 3` (safe, touches no copy). Do NOT run
+  `use_copy_junction.bat` again.
+- Corrected live-test procedure: (1) `undo_junction.bat` (tidy, optional but recommended); (2)
+  `setx FC3COOP_FAKE_PARTY 1`; (3) fully quit Ubisoft Connect (incl. tray) and reopen; (4) Play FC3 - upc runs the
+  copy directly, proxy `sha1 e045f054` + fakes active; (5) navigate to the co-op menu; agent then reads
+  `H:\FarCryCoop\TestFC3_105\bin\uplay_api.log`.
+- If Ubisoft Connect still shows "could not verify access to this game", that is an account/entitlement matter for
+  the account currently signed in (it must own FC3 and be online) - owner-side, outside the mod work.
+
+
+### Session 28k (same day) - LIVE milestone: co-op connect reached; the blocker is the NATIVE "FC3 service", not orbit
+
+First fully-stable live run of the copy through the proxy (owner: `setx FC3COOP_FAKE_PARTY 1` + full UC restart +
+Play). No crash; the game bootstrapped and ran its normal orbit pump. Owner navigated main menu -> "ИГРА ОНЛАЙН"
+(co-op) -> the game showed a sequence of dialogs, screenshotted:
+1. "Вы не подключены к серверам Ubisoft. Хотите попробовать подключить сейчас?" (OK/Cancel)
+2. after OK: "Идет подключение к серверам Far Cry 3. Пожалуйста, подождите."
+3. end state: **"ОШИБКА. Служба Far Cry 3 недоступна. Повторите попытку позже."**
+
+Findings from the proxy log:
+- The co-op navigation raised `UPLAY_USER_IsConnected` repeatedly and our `[FAKE] ret=1` fired every time - **yet
+  the game still reported "not connected"**. So the game's notion of "connected to the co-op service" is NOT driven
+  by the orbit `IsConnected` bool.
+- During "Идет подключение" the log shows the async pattern `UPLAY_HasOverlappedOperationCompleted` (+`
+  GetOverlappedOperationResult`) spinning - the game issued an async orbit op and was polling it.
+- At the "Служба недоступна" error the log shows **ONLY** the idle `UPLAY_Update`/`GetNextEvent` pump - **zero
+  orbit exports** accompany the failure. => The Far Cry 3 co-op service connection is performed by the game's own
+  networking stack (storm::echo / PRUDP over UDP straight to the Ubisoft FC3 co-op backend), NOT through
+  `uplay_r1_loader`. That backend is shut down, so the connect fails and co-op refuses to open.
+
+Conclusion / strategy: orbit transparency + bool fakes are correct and proven but can only cover the orbit API
+surface. The real gate is the native co-op-service connection (and only after it succeeds does the Rv party manager
+`DAT_12805180+4` / gate `FUN_11218480` get fed). Two directions to actually get offline co-op:
+- (A) Local fake co-op server: point the game's co-op-service endpoint to a local host speaking storm::echo/PRUDP
+  enough to drive the party handshake to "available". Needs the endpoint (host:port) + protocol trace.
+- (B) Patch the game's service/connection state machine in `FC3.dll` so it skips/simulates the service-available
+  check and proceeds to the Rv party layer, then populate the party manager there (the 28g-28h map).
+Both are large; next offline step that serves (A) either way is to locate the co-op service endpoint the game dials.
+This validates the project thesis end-to-end: the co-op blocker is a dead online service reached by native netcode,
+not the orbit login checks.
+
+
+### Session 28l (same day) - co-op online stack identified in FC3.dll: RendezVous + storm::echo + .svc SOAP; `-coop` CLI flag
+
+Offline strings scan of `FC3.dll` / `FC3_d3d11.dll` (read-only) grounds the 28k strategy fork.
+
+- **"Rv" = RendezVous**, Ubisoft's online session/matchmaking backend. Source paths baked in the binary:
+  `..\platforms\win32\OnlineSession\RendezVousBackEndServices_native.cpp` and
+  `..\platforms\win32\OnlineSession\RendezVousGuestBackEndServices_native.cpp`. RendezVous session messages present:
+  `GameSessionUnsuccessfulJoinSession`, `GameSessionSearchWithParticipantsResult`, `GameSessionInvitationReceived`.
+  This is the same layer as the 28g gate `FUN_11218480` and the loader's `RVCreateGameSession`/`RVJoinGameSession`
+  RVAs - the "RendezVous Create/Join GameSession" entry points.
+- **Transport is `storm::echo`**: `storm::echo::RoutablePacket`, `storm::echo::session_time::...`,
+  `storm::echo::simulation::internal::inEvent::CreateCamera`, `CEchoStartupParams`. Confirms the PLAN's
+  "native storm::echo" direction; the co-op data plane rides storm::echo, the lobby/matchmaking plane rides
+  RendezVous.
+- **Online services are HTTP/SOAP**: `/OnlineConfigService.svc/GetOnlineConfig?onlineConfigID=...` and SOAP
+  `<s:Envelope ...soap-envelope...>` - a WCF `.svc` config service. The live "Служба недоступна" (28k) is this
+  RendezVous/config backend being unreachable; the endpoint is fetched at runtime (Uplay + OnlineConfig), which is
+  why no plain co-op hostname is hard-coded in the DLL.
+- **Co-op CLI flags exist**: `-coop`, `-coopchallengesettings`, `-firestorm`, `-fromuplay`, `-sessionuid`,
+  `-networktimeslice`. A `-coop` launch option may force co-op mode; cheap to probe but co-op still needs the
+  service, so it is unlikely to bypass the gate on its own.
+- Co-op gameplay objects: `CFCXCompetitiveCoop*`, `CCoopChallengeService`, `CCoopAISpawnerService`,
+  `ActivateCoopGate`, `CDominoNetFunc*Coop*` - the co-op session content once a session exists.
+
+Strategy read (recommendation to owner): direction (B) is the tractable path - patch `RendezVousBackEndServices_native`
+/ the RV Create/Join path in `FC3.dll` so a local join is reported successful and feed the Rv party manager
+(`DAT_12805180+4`, gate `FUN_11218480`, getter `FUN_103660e0`), bypassing the dead RendezVous backend. Direction (A)
+(local fake RendezVous+storm::echo server) is higher effort because the backend is config-driven SOAP + echo. Next
+offline work: locate the RendezVous back-end native functions and the code that raises "service unavailable".
+
+
+### Session 28m (same day) - FUN_11218480 is party-join APPROVAL (not create/connect); RendezVous backend is virtual+config-driven (`scripts/probe_rv_backend.py`)
+
+Full decompile of the join gate and a backend probe (`scripts/probe_rv_backend.py`) refine direction (B).
+
+- **`FUN_11218480` (thiscall) is the party-join APPROVAL, not session create/connect.** Guarded first by
+  `FUN_102000d0(mgr, mgr+0x118, mgr+0x11c)`; then it builds the candidate joiner list (`FUN_11273650`), counts
+  joiners that pass `FUN_1193b8c0`, and REJECTS (returns 0) with log strings "Rejecting partyId: %u; New joiners
+  count: %d because the result teams would have a size difference > 2 ..." and "... more than half the max allowed
+  size for the current playlist". When the connected-guard fails it just `return 1` (no-op). So this is balancing of
+  joiners on an ALREADY-CONNECTED party; it is NOT where "Служба недоступна" comes from.
+- **RV Create/Join are virtual-dispatched** - `RVCreateGameSession 0x10cf6790` / `RVJoinGameSession 0x10cf6690`
+  (loader describe() tags, FC3_d3d11 RVA space) have 0 rel32 callers in FC3.dll; they run through a vtable (like the
+  gate). **The RendezVous tokens found in strings are RTTI/template names** (`qlist<GameSession...>`,
+  `ANetObject.LobbyService`), and `RendezVousBackEndServices_native.cpp` / `OnlineConfigService.svc` have 0 direct
+  code immediates in `.text` -> referenced indirectly. So the RV service object graph is reached via virtual calls and
+  the endpoint is fetched at runtime; it does not resolve by offline string-xref.
+- Implication: the "Служба недоступна" raise site and the RV Create/Join native functions can't be pinned purely
+  offline. Two ways forward for direction (B): (1) LIVE instrumentation (Frida) on the running game to break on the
+  RendezVous session object / the party-manager singleton `DAT_12805180+4` and capture the exact connect+fail call
+  sequence; or (2) locate the Russian dialog string in the localization data -> its key -> the code referencing the
+  key (= the raise site to neutralize). Both are a new phase; the offline orbit+proxy phase is complete and proven.
+
+
+### Session 28n (same day) - proxy log now suppresses the idle pump (FC3COOP_LOG_PUMP); localization is in packed .dat
+
+- The live run's `uplay_api.log` ballooned to ~95 MB because every idle `UPLAY_Update`/`UPLAY_GetNextEvent` (~1 Hz
+  each) was logged. `log_entry` now returns early for those two names unless `FC3COOP_LOG_PUMP` is set, so real
+  co-op/party calls stay readable. Rebuilt x86 clean (`BUILD_DONE 0`); deploy pending (the running game locks
+  `bin\uplay_r1_loader.dll`; close `farcry3_d3d11.exe` to redeploy `sha1 e045f054`-successor).
+- The "Служба недоступна" dialog text and all UI strings live in Ubisoft packed archives `data_win32\{common,patch,ige}.dat`
+  (+ `.fat`), so the localization-key -> raise-site trace (28m option 2) needs a `.dat/.fat` unpacker first - a new
+  sub-tool. Together with the virtual/config RendezVous backend, this closes the productive OFFLINE-only avenues for
+  direction (B). Next real step needs the live game instrumented (Frida) or the packed data unpacked.
+
+
+### Session 28o (same day) - co-op service endpoint found via Frida: lb-rdv-as-prod01.ubisoft.com / UDP 11000-11001 (REACHABLE, responds)
+
+`scripts/frida/fc3_coop_trace.py` capture on the live co-op connect (`local/scratch/frida_coop_*.log`):
+
+- **RendezVous host:** `gethostbyname("lb-rdv-as-prod01.ubisoft.com")` resolves (non-null hostent). rdv = RendezVous.
+- **The game exchanges UDP with the backend:** `sendto -> 203.132.26.108:11000`, `203.132.26.108:11001`,
+  `203.132.26.109:11000`, and `recvfrom` returns packets (4) - the backend ANSWERS. So it is NOT a dead host /
+  routing wall; the storm::echo / PRUDP UDP handshake happens and gets responses.
+- **Game sockets:** `bind 0.0.0.0:3074` (Ubisoft standard NAT/live port) and `bind 192.168.1.8:9000` (the local
+  storm::echo data port on the LAN IP). Repeated `gethostbyname("IT")` = the game resolving the local PC name
+  (COMPUTERNAME `IT`) while enumerating local interfaces - noise, not the service.
+- **Conclusion:** "Служба Far Cry 3 недоступна" is an application-layer outcome of the RendezVous handshake
+  (the server likely still accepts the socket but rejects/deprecates the FC3 rendezvous tenant/session ops), NOT a
+  reachability failure. The lever is now the handshake CONTENT and outcome.
+- **Next tool step:** the tracer now dumps the first 64 bytes (hex) of `sendto`/`recvfrom` to/from the rendezvous
+  ports. Re-capture once to read the actual handshake and the server's refusal -> that bytes-level view enables both
+  (A) a local fake RendezVous (replay/forge the handshake) and (B) pinpointing the game-side call to neutralize.
+
+
+### Session 28p (same day) - rendezvous recon result: backend alive + responds; blocker is app-layer PRUDP/RendezVous negotiation
+
+Repeated fresh live captures (`frida_coop_*.log`) reliably show the online init at the main menu:
+`gethostbyname("lb-rdv-as-prod01.ubisoft.com")` resolves, game `bind`s `0.0.0.0:3074` + `<lan>:9000`
+(storm::echo). The actual co-op connect UDP burst (`sendto -> 203.132.26.108/109:11000/11001` + `recvfrom`
+replies, NOTES 28o) fired on the first fresh session and is intermittent after that (the client short-circuits to
+"service unavailable" on later attempts). Net findings, unchanged by the extra runs:
+
+- RendezVous backend is **reachable and ANSWERS UDP** - it is not a dead-host / DNS / routing wall, and not the
+  orbit/Uplay layer (that is already faked by the loader proxy).
+- The "Far Cry 3 service is unavailable" is therefore the **RendezVous application-layer (PRUDP) negotiation** for
+  the FC3 title/tenant failing on the server side.
+- Reimplementing PRUDP is the only way to make a *server* answer it. This is a real fork in investment:
+  - **(A) local PRUDP/RendezVous emulator** (point `lb-rdv-*` via hosts, speak PRUDP+ticketing) - highest fidelity
+    for "friends join over the internet through us", but multi-week protocol RE.
+  - **(B) bypass RendezVous in FC3.dll and run the co-op session on the game's own echo/peer transport (LAN
+    first, relay later)** - avoids PRUDP; needs the RV session-create/join call sites, which are virtual-dispatched
+    and only resolvable by live tracing the RV/echo objects (keep the frida tracer, hook the RV natives on the
+    sendto path once named). Medium-high, uncertain.
+  - **(C) document as a known blocker with the endpoint identified** and scope down.
+
+Recommendation: (B) LAN-first (matches the coop-networking playbook and skips PRUDP); the next technical step is a
+frida trace that names the RV create/join natives reached right before the "unavailable" dialog.
+
+
+### Session 28q (same day) - direction B unlocks the RV chain; CRITICAL module-identity correction
+
+The backtrace capture (frida_coop log) attributed every rendezvous/echo call to **FC3_d3d11.dll**
+(the running process is `farcry3_d3d11.exe`), never to `FC3.dll`. Named chains (RVA = addr - 0x10000000):
+
+- **RendezVous bootstrap** (drives `gethostbyname("lb-rdv-as-prod01.ubisoft.com")`):
+  `FC3_d3d11.dll+0x122f759` <- `+0x122f96f` <- `+0x123311e` <- `+0x1279bc5` <- `+0x127a320` <- `+0x127a3d2`.
+- **storm::echo socket setup** (`bind <lan>:9000`): wrapper `+0xe5be2c` / `+0xe5be51` <- `+0x41a795` <-
+  `+0x92d2bd` <- pump `+0x55171e` <- `+0x550d96` <- `+0x551737` <- `+0x4f907f`; a second path
+  `+0xe82eef` <- `+0xec069c` <- `+0xefafcf` <- `+0xe666a2`.
+
+**CRITICAL correction (verified with scripts/probe_rv_live.py):** the copy's on-disk binaries differ from
+the real install and from the earlier Ghidra target:
+  - running module = `H:\FarCryCoop\TestFC3_105\bin\FC3_d3d11.dll`  md5 **46bcc097**, 30,057,832 B,
+    ImageBase 0x10000000, SizeOfImage 0x23cc000, machine 0x14c (x86), **not packed / disassembles cleanly**;
+    `FC3.dll` in the copy = md5 5ff04533.
+  - the earlier Ghidra project FC3_106 analysed the real-install `FC3.dll` md5 **5742de2a** (40.7 MB, DX9) -
+    a DIFFERENT file. **All RVAs from sessions 28e-28h (FUN_11218480 party gate etc.) were derived from the
+    wrong binary and do NOT map to the running game.** All future RV/echo/gate RE must target md5 46bcc097.
+
+The RV bootstrap disasm at VA 0x1122f700-0x1122f870 (from probe_rv_live.py) is real code: it calls IAT slots
+0x114ac6e4 / 0x114ac690 with string args at 0x116bc50c / 0x116bc594 and a local call 0x11211290 whose return is
+exactly the frame 0x1122f759 - i.e. this function is the RV host resolver. Next: import md5 46bcc097 into a fresh
+Ghidra project, auto-analyze, and decompile the RV bootstrap + echo-setup chains to design the direction-B bypass.
+
+
+### Session 28r (same day) - RV map decoded + net engine has a first-class LAN mode (direction B needs NO PRUDP)
+
+Ghidra import+analysis of the running `FC3_d3d11.dll` copy (md5 46bcc097, project `FC3d3d11_live`, ~48 min),
+then decompiled the 28q chains (`rv_decompile.txt`). Maps:
+
+- **RendezVous bootstrap chain (top->down):** game entry `FUN_1044123b` -> `FUN_1127a3b0` -> `FUN_1127a300`
+  -> **`FUN_11279ba0` (the gate: returns 1 only if the RV net-op `FUN_112492a0` succeeds, else 0)** ->
+  on success `FUN_1127a1d0` does the post-RV session op. Config side: `FUN_1122f870` parses a server URL string,
+  `FUN_1122f680` splits `address=<host>;port=<n>`, resolver `FUN_11211290` = `inet_addr` else `gethostbyname`
+  (IPv4 stored at obj+4; special-case "255.255.255.255"). Lazy "ready" flag getter `FUN_11233110` returns obj+0x4a.
+- **Net engine init `FUN_1092d256` (caller only via a vtable at 0x115c0e24):** has a FIRST-CLASS connection mode:
+  `param_1[0xe]` = 0 -> logs **"LAN"**, 1 -> **"Online"**, 2 -> **"Offline"**; plus a singleton
+  `(**(*DAT_11e42a90 + 4))()` returning 1/2/3 mapped to 3/2/1 (a network-type selector). It binds the echo UDP
+  socket (`FUN_1041a75a` -> `FUN_10e5bdc0`) and only errors "Net engine initialization failed.(UDP binding)"
+  (code -0xf4229) on a bind failure. `FUN_105516a8` is the per-frame session pump (states 0..4 over a peer list).
+
+**Direction-B conclusion (de-risked):** the game ALREADY has a LAN netcode path; co-op only fails because the
+session is put in "Online" mode and then RendezVous refuses the FC3 tenant. The lever is the **network-mode
+selector**, not PRUDP. Concrete next steps:
+1. Find every writer of the mode (fields around `obj+0xe`, the `DAT_11e42a90` singleton + its vtable slot +4) and
+   where the co-op menu sets Online vs LAN.
+2. Frida **in-memory** experiment (no disk writes): force the net mode to LAN (and/or force `FUN_11279ba0` to
+   return 1) at the co-op connect, and observe whether "service unavailable" disappears and which sockets/peers the
+   LAN path then uses. This is the safe go/no-go test before any on-disk patch.
+
+> **28r addendum (rv2 pass):** gate FUN_11279ba0 first reads global online flag `FUN_11245090`=`DAT_11f07e48`
+> (0 -> immediate fail); net-op FUN_112492a0 reads config **"SandboxUrl"**, status 2/3 -> fail, else needs
+> `FUN_11233110` (address resolved) -> success; post-RV FUN_1127a1d0 builds a **UbiAuthentication** session
+> (RendezVous/Services/UbiAuthentication/.../UbiAuthenticationClient.cpp). Forcing the gate alone dead-ends at
+> UbiAuth, so direction B must use the engine's LAN mode (`FUN_1092d256` param+0xe:0), not fake online success.
+> Network-type singleton DAT_11e42a90 is read ~80x / written once (constructor FUN_100bc087).
+
+
+### Session 28s (same day) - co-op session dispatcher decodes a NON-RV path (direction B lever) + live Frida now blocked by anti-injection
+
+Fast re-decompiles of the analyzed `FC3d3d11_live` (no re-analysis) resolved the mode decision:
+
+- **Co-op session-create dispatcher `FUN_10441fb6`** (invoked via a vtable at 0x11526798): resolves a per-session
+  record (`FUN_10431a1b` over `FUN_1041dba9`; record stride 0x90, id at +0x10) and branches on a byte flag `*(rec+5)`:
+  - flag `== 0` -> **`FUN_1044123b` = the ONLINE path** -> RV bootstrap (`FUN_1127a380`/`FUN_1127a3b0`) -> UbiAuth (dead).
+  - flag `!= 0` -> **`FUN_10443663` = the NON-RV path** -> `FUN_11275f40(rec, &id, ..., this+1)` creates/joins the
+    session WITHOUT RendezVous. Both report failures through the error-code dispatcher `FUN_104532ec`.
+
+So the engine already contains a non-RV co-op session path; direction B = make the co-op session take
+`FUN_10443663`/`FUN_11275f40` instead of the online `FUN_1044123b`. Open questions (next static work): confirm
+`FUN_11275f40` is a direct storm::echo/UDP peer host (no Ubisoft), and locate where the record +5 LAN flag is set
+(i.e. whether the co-op host/join UI can create a LAN-type session, or it is hard-wired online).
+
+**Live Frida is now blocked:** the x86 injector is healthy (attaching Frida to a 32-bit SysWOW64 process succeeds in
+2.1s, same frida-helper-x86 path the game uses), but attach to `farcry3_d3d11.exe` reliably times out even on a fresh
+game after purging all frida-helpers. => FC3's anti-injection is now consistently refusing attach (in 28q the same
+tracer attached fine). The interactive force-probe is therefore unreliable; continue via static + on-disk patch tests.
+
+
+### Session 28t (same day) - DEFINITIVE: campaign co-op session is RendezVous-mandated (no in-engine LAN path)
+
+Final fast decompiles settle direction B's feasibility:
+
+- The "other" co-op flavor `FUN_10443663 -> FUN_11275f40` STILL calls the RendezVous gate `FUN_11279ba0`, then
+  **`FUN_11275d90`**, which references `.../online/RendezVous/RendezVous/Services/SubAccount/src/Client/SubAccountClient.cpp`
+  and calls `FUN_112536a0(...)` = create a **RendezVous Session**. So this branch is the RendezVous **host** path
+  (SubAccount + RVSession). The `+5==0` branch (`FUN_1127a1d0`) is the RendezVous **UbiAuthentication join** path.
+- Therefore BOTH campaign co-op session flavors go through RendezVous (`FUN_11279ba0` is mandatory), which needs
+  OnlineConfigService/`SandboxUrl` + Ubi auth - all dead. The net engine's LAN/Online/Offline (`FUN_1092d256`) is
+  only transport initialization; there is **no non-RendezVous co-op session code path** to force.
+
+**Reassessment:** direction B as "force LAN / skip RendezVous in-engine" is NOT viable - nothing to redirect to.
+The only remaining technical routes are large:
+  - **(A) emulate the Ubisoft online stack** the co-op path needs (OnlineConfigService SOAP -> SandboxUrl,
+    RendezVous/PRUDP session server, UbiAuthentication, SubAccount) so the client completes its own handshake.
+  - **(A') deeper patch at the RendezVous Session layer**: intercept RV session peer-address exchange (PRUDP) so
+    the game is handed peer LAN addresses instead of relays; still requires understanding RV/PRUDP session semantics.
+Reusable assets so far: the loader-proxy (orbit fakes, ABI-correct) and the full RV call map (28r-28t). Recommend
+documenting this blocker with the map + the PR, then deciding whether to fund an (A)/(A') spike.
+
+
+### Session 28u (same day) - A' spike verdict: peer-address injection needs full RV session emulation; both A and A' are large
+
+A'-spike (static, no edits) traced the RV host session create `FUN_112536a0` (`RendezVous/Core/.../BackEndServices.cpp`):
+it requires `FUN_11237670` (RV connected), builds the session via factory `FUN_112532a0(...)` stored at `obj+0x74`,
+starts it via a vtable call (`*vtable+4`) and `FUN_112283a0(obj,0)`. The RV Session client is exactly the component
+that, over PRUDP, performs matchmaking and hands each peer the other's address. Therefore:
+
+- **A' (patch the RV-session layer to inject LAN peer addresses) is not cheaper than A** - to form a session the game
+  still needs the RV session to deliver real peer addresses and drive the storm::echo exchange; without the RV service
+  (or a reimplementation of its session semantics) there are no addresses to hand out, so the session cannot form.
+- **A (emulate the Ubisoft online stack)** requires, at minimum: (1) `OnlineConfigService` SOAP returning a
+  `SandboxUrl`/rendezvous config, (2) a **RendezVous server speaking PRUDP** (RC4/DH + ticketing + mutex/state machine
+  + session matchmaking), (3) `UbiAuthentication` login, (4) `SubAccount` - all for the FC3 title. Weeks-scale.
+
+**Bottom line (honest):** FC3 campaign co-op is deeply coupled to Ubisoft's RendezVous + UbiAuth + SubAccount stack;
+there is no in-engine LAN path and no cheap gate-patch. Reusable, shippable assets: the ABI-correct loader proxy
+(orbit fakes) and the complete static RV call map (28r-28u). Recommendation: ship those (PR) and record the RV wall;
+pursuing A is a multi-protocol project that should be scoped as its own effort, not continued piecemeal here.

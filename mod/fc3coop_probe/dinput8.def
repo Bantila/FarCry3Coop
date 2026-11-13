@@ -1,0 +1,19 @@
+; dinput8.def -- export map for the FC3 co-op H1 probe proxy.
+;
+; The real x86 dinput8.dll exports exactly these six functions by name and
+; ordinal; every one of them is forwarded by fc3coop_probe.c to the genuine
+; system dinput8.dll. Exporting the complete set (names AND ordinals 1..6) is
+; what keeps the game loading: the engine's import table resolves by name, and
+; any missing entry is a missing-function crash at startup.
+;
+; No NONAME is used on purpose: the exports must be visible by name as well as
+; by ordinal. The internal symbol for each entry is the undecorated name above;
+; link.exe matches it to the __stdcall decorated symbol in the object file.
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create                      @1
+    DllCanUnloadNow                         @2
+    DllGetClassObject                       @3
+    DllRegisterServer                       @4
+    DllUnregisterServer                     @5
+    GetdfDIJoystick                         @6
